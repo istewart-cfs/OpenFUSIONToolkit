@@ -187,6 +187,11 @@ END TYPE tw_type
 REAL(r8) :: quad_tols(3) = [0.75d0, 0.95d0, 0.995d0] !< Distance tolerances for quadrature order selection
 INTEGER(i4) :: quad_orders(3) = [18, 10, 6] !< Quadrature order for each tolerance
 REAL(r8), PARAMETER :: target_err = 1.d-8
+!> Quadrature target of the inductance cell-pair kernel (@ref tw_cell_pair_kernel). Looser than `target_err`: the
+!! order formula assumes the error falls as (2h/d)^order, which is very pessimistic for 1/r between separated
+!! triangles. With 1E-6 the change to L is ~1E-9 relative to the matrix (eigenvalues ~1E-9), well below the HODLR/ACA
+!! compression tolerances, while assembly is ~1.75x faster than with 1E-8.
+REAL(r8), PARAMETER :: tw_L_quad_err = 1.d-6
 INTEGER(i4), PARAMETER :: tw_max_grade = 60 !< Maximum graded panels on each side of a segment's closest point
 INTEGER(i4), PARAMETER :: tw_coil_group_size = 1000 !< Target number of cells per group for element-coil ACA
 INTEGER(i4), PARAMETER :: tw_coil_chunk_size = 96 !< Segments per coil chunk for element-coil ACA
@@ -2961,7 +2966,7 @@ dl_max=SQRT(dl_max)
 IF(dl_min<1.d-8)THEN
   iquad = 18
 ELSE
-  iquad = MAX(4,MIN(18,ABS(INT(LOG(target_err)/LOG(1.d0-dl_min/dl_max)))))
+  iquad = MAX(4,MIN(18,ABS(INT(LOG(tw_L_quad_err)/LOG(1.d0-dl_min/dl_max)))))
 END IF
 tmp=0.d0
 np=tw_quads(iquad)%np
