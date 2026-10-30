@@ -54,11 +54,11 @@ TYPE :: hole_mesh
   REAL(r8) :: ptcc(3) = 0.d0
 END TYPE hole_mesh
 !---------------------------------------------------------------------------------
-!> Structure containing definition of a flux loop sensor
+!> Structure containing definition of a flux loop sensor or a point Mirnov probe
 !---------------------------------------------------------------------------------
 TYPE :: floop_sensor
   LOGICAL :: point = .FALSE. !< Point probe: signal is the field along `norm` at `r(:,1)` (point Mirnov sensor)
-  INTEGER(i4) :: np = 0 !< Number of points in loop
+  INTEGER(i4) :: np = 0 !< Number of points in loop (1 for a point probe)
   REAL(r8) :: scale_fac = 1.d0 !< Scale factor to apply to signal
   REAL(r8) :: norm(3) = 0.d0 !< Unit normal of a point probe
   REAL(r8), POINTER, DIMENSION(:,:) :: r => NULL() !< List of points [3,np]
@@ -80,9 +80,9 @@ END TYPE jumper_sensor
 !> Structure containing sensor sets
 !---------------------------------------------------------------------------------
 TYPE :: tw_sensors
-  INTEGER(i4) :: nfloops = 0 !< Number of flux loops
+  INTEGER(i4) :: nfloops = 0 !< Number of flux loops and point probes
   INTEGER(i4) :: njumpers = 0 !< Number of current jumpers
-  TYPE(floop_sensor), POINTER, DIMENSION(:) :: floops => NULL() !< List of flux loops
+  TYPE(floop_sensor), POINTER, DIMENSION(:) :: floops => NULL() !< List of flux loops and point probes
   TYPE(jumper_sensor), POINTER, DIMENSION(:) :: jumpers => NULL() !< List of current jumpers
 END TYPE tw_sensors
 !---------------------------------------------------------------------------------
@@ -192,16 +192,17 @@ REAL(r8), PARAMETER :: target_err = 1.d-8
 !! triangles. With 1E-6 the change to L is ~1E-9 relative to the matrix (eigenvalues ~1E-9), well below the HODLR/ACA
 !! compression tolerances, while assembly is ~1.75x faster than with 1E-8.
 REAL(r8), PARAMETER :: tw_L_quad_err = 1.d-6
-INTEGER(i4), PARAMETER :: tw_max_grade = 60 !< Maximum graded panels on each side of a segment's closest point
+INTEGER(i4), PARAMETER :: tw_max_grade = 60 !< Maximum graded panels on each side of a grading point
 INTEGER(i4), PARAMETER :: tw_coil_group_size = 1000 !< Target number of cells per group for element-coil ACA
 INTEGER(i4), PARAMETER :: tw_coil_chunk_size = 96 !< Segments per coil chunk for element-coil ACA
 INTEGER(i4), PARAMETER :: tw_coil_aca_rmin = 4 !< Minimum ACA rank for element-coil blocks
 REAL(r8), PARAMETER :: tw_coil_aca_sep = 0.7d0 !< Separation ratio (distance/(sum of extents)) for element-coil ACA
 REAL(r8), PARAMETER :: tw_coil_aca_tol = 1.d-7 !< Relative ACA tolerance for element-coil blocks
 INTEGER(i4), PARAMETER :: tw_ring_chunk_size = 64 !< Circular coil filaments per chunk for element-coil ACA
-!> 4-point Gauss-Legendre rule on [0,1]: nodes and weights
+!> 4-point Gauss-Legendre rule on [0,1]: nodes
 REAL(r8), PARAMETER :: tw_gl4_x(4) = [0.5d0-0.5d0*0.8611363115940526d0, 0.5d0-0.5d0*0.3399810435848563d0, &
   0.5d0+0.5d0*0.3399810435848563d0, 0.5d0+0.5d0*0.8611363115940526d0]
+!> 4-point Gauss-Legendre rule on [0,1]: weights
 REAL(r8), PARAMETER :: tw_gl4_w(4) = [0.5d0*0.3478548451374538d0, 0.5d0*0.6521451548625461d0, &
   0.5d0*0.6521451548625461d0, 0.5d0*0.3478548451374538d0]
 INTEGER(i4), PARAMETER :: tw_quad_far_max = 10 !< Highest quadrature order of far-field cell-pair integrals (closer pairs integrate one cell analytically)
@@ -210,8 +211,55 @@ REAL(r8), PARAMETER :: coil_min_rad = 1.d-6
 TYPE(oft_quad_type), TARGET, SAVE :: tw_quads(18) !< Triangle quadrature rules of orders 1-18 (shared)
 LOGICAL, SAVE :: tw_quads_ready = .FALSE. !< Have tw_quads been set up?
 integer(i4), public, parameter :: tw_idx_ver=1 !< File version for array indexing
-integer(i4), public, parameter :: tw_cache_ver=2 !< Version of cached matrix files (increment when a change invalidates existing caches)
+integer(i4), public, parameter :: tw_cache_ver=4 !< Version of cached matrix files (increment when a change invalidates existing caches)
 character(LEN=16), public, parameter :: tw_idx_path="ThinCurr_Version" !< HDF5 field name
+!------------------------------------------------------------------------------
+!> Rows and columns of a matrix block for ACA+ (@ref tw_aca_plus)
+!------------------------------------------------------------------------------
+TYPE, ABSTRACT :: tw_aca_source
+CONTAINS
+  !> Row `i` of the block [ncols]
+  PROCEDURE(tw_aca_vector), DEFERRED :: row
+  !> Column `j` of the block [nrows]
+  PROCEDURE(tw_aca_vector), DEFERRED :: col
+END TYPE tw_aca_source
+ABSTRACT INTERFACE
+  !> Row or column `i` of an ACA+ block
+  SUBROUTINE tw_aca_vector(self,i,vec)
+    IMPORT :: tw_aca_source
+    CLASS(tw_aca_source), INTENT(inout) :: self !< Block source
+    INTEGER(4), INTENT(in) :: i !< Row or column index
+    REAL(8), INTENT(out) :: vec(:) !< Row [ncols] or column [nrows] of the block
+  END SUBROUTINE tw_aca_vector
+END INTERFACE
+!------------------------------------------------------------------------------
+!> Cell-segment kernel between a group of cells (rows) and consecutive segments of a coil filament (columns)
+!------------------------------------------------------------------------------
+TYPE, EXTENDS(tw_aca_source) :: tw_aca_segblock
+  CLASS(oft_bmesh), POINTER :: mesh => NULL() !< Mesh
+  INTEGER(i4), ALLOCATABLE :: cells(:) !< Row cells
+  REAL(r8), ALLOCATABLE :: pts(:,:) !< Segment end points [3,nseg+1]
+CONTAINS
+  PROCEDURE :: row => tw_aca_segblock_row
+  PROCEDURE :: col => tw_aca_segblock_col
+END TYPE tw_aca_segblock
+!------------------------------------------------------------------------------
+!> Cell-ring kernel between the three basis functions of a group of cells (rows, three per cell) and circular
+!! filaments (columns). A row needs all three basis functions of its cell, so they are kept for the other two.
+!------------------------------------------------------------------------------
+TYPE, EXTENDS(tw_aca_source) :: tw_aca_ringblock
+  CLASS(oft_bmesh), POINTER :: mesh => NULL() !< Mesh
+  INTEGER(i4), ALLOCATABLE :: cells(:) !< Cells
+  REAL(r8), ALLOCATABLE :: qbasis(:,:,:) !< Basis function directions of each cell [3,3,ncells]
+  REAL(r8), ALLOCATABLE :: rz(:,:) !< Radius, height and orientation of each filament [3,nrings]
+  REAL(r8), ALLOCATABLE :: radius(:) !< Wire radius of each filament
+  INTEGER(i4) :: nslot = 0 !< Number of cells with stored rows
+  INTEGER(i4), ALLOCATABLE :: slot(:) !< Storage slot of each cell (0: not computed)
+  REAL(r8), ALLOCATABLE :: rows(:,:,:) !< Stored rows of computed cells [nrings,3,:]
+CONTAINS
+  PROCEDURE :: row => tw_aca_ringblock_row
+  PROCEDURE :: col => tw_aca_ringblock_col
+END TYPE tw_aca_ringblock
 CONTAINS
 !---------------------------------------------------------------------------------
 !> Set up the shared triangle quadrature rules (done once, by the first @ref tw_setup)
@@ -973,17 +1021,19 @@ END FUNCTION tw_seg_lineint
 !> Double integral over two straight segments of the softened inverse distance,
 !! \f$ \int_A \int_B ds\,dt / \sqrt{|x(s)-y(t)|^2 + c^2} \f$
 !!
-!! Exact along B (@ref tw_seg_lineint) and by Gauss-Legendre on panels graded toward the closest approach along A;
-!! a segment with itself uses the closed form \f$ 2 [L\,\mathrm{asinh}(L/c) - \sqrt{L^2+c^2} + c] \f$.
+!! Exact along B (@ref tw_seg_lineint) and by Gauss-Legendre along A on panels graded toward every point where the
+!! integrand can be nearly singular: the ends of A, the closest approach, and the projections of B's ends onto A
+!! (for nearly parallel segments the kinks where A passes B's ends). Each point is graded from its distance to B.
+!! A segment with itself uses the closed form \f$ 2 [L\,\mathrm{asinh}(L/c) - \sqrt{L^2+c^2} + c] \f$.
 !---------------------------------------------------------------------------------
 FUNCTION tw_seg_seg_int(a0,a1,b0,b1,c2) RESULT(val)
 REAL(r8), INTENT(in) :: a0(3) !< Start of segment A
 REAL(r8), INTENT(in) :: a1(3) !< End of segment A
 REAL(r8), INTENT(in) :: b0(3) !< Start of segment B
 REAL(r8), INTENT(in) :: b1(3) !< End of segment B
-REAL(r8), INTENT(in) :: c2 !< Softening c^2 (> 0)
-REAL(r8) :: val,ua(3),ub(3),la,lb,s,d,h,x(3),edges(0:2*tw_max_grade+2)
-INTEGER(i4) :: ne,ip,ig
+REAL(r8), INTENT(in) :: c2 !< Softening c^2 (0 for 1/|r|)
+REAL(r8) :: val,ua(3),ub(3),la,lb,s,d,h,x(3),edges(0:2*tw_max_grade+2),sp(5),hp(5),half
+INTEGER(i4) :: ne,ip,ig,np,k,side
 la=SQRT(SUM((a1-a0)**2)); lb=SQRT(SUM((b1-b0)**2))
 val=0.d0
 IF((la<=0.d0).OR.(lb<=0.d0))RETURN
@@ -993,13 +1043,43 @@ IF((MAXVAL(ABS(a0-b0))+MAXVAL(ABS(a1-b1))<=1.d-12*la).OR.(MAXVAL(ABS(a0-b1))+MAX
   val=2.d0*(la*ASINH(la/SQRT(h))-SQRT(la*la+h)+SQRT(h))
   RETURN
 END IF
+!---Points along A to grade toward (sorted, duplicates removed)
 CALL tw_seg_closest(a0,a1,b0,b1,s,d)
-h=MAX(d,SQRT(c2),1.d-6*la)
-CALL tw_graded_panels(la,s*la,h,edges,ne)
-DO ip=1,ne
-  DO ig=1,4
-    x=a0+(edges(ip-1)+tw_gl4_x(ig)*(edges(ip)-edges(ip-1)))*ua
-    val=val+tw_gl4_w(ig)*(edges(ip)-edges(ip-1))*tw_seg_lineint(x,b0,ub,lb,c2)
+sp(1:5)=[0.d0, la, s*la, MIN(la,MAX(0.d0,DOT_PRODUCT(b0-a0,ua))), MIN(la,MAX(0.d0,DOT_PRODUCT(b1-a0,ua)))]
+DO k=2,5 ! Insertion sort
+  h=sp(k)
+  DO np=k-1,1,-1
+    IF(sp(np)<=h)EXIT
+    sp(np+1)=sp(np)
+  END DO
+  sp(np+1)=h
+END DO
+np=1
+DO k=2,5
+  IF(sp(k)-sp(np)>1.d-12*la)THEN
+    np=np+1; sp(np)=sp(k)
+  END IF
+END DO
+sp(np)=la
+DO k=1,np
+  hp(k)=MAX(tw_point_seg_dist(a0+sp(k)*ua,b0,ub,lb),SQRT(c2),1.d-6*la)
+END DO
+!---Each interval between points: halves graded toward its two ends
+DO k=1,np-1
+  half=0.5d0*(sp(k+1)-sp(k))
+  DO side=0,1
+    IF(side==0)THEN
+      CALL tw_graded_panels(half,0.d0,MIN(hp(k),half),edges,ne)
+    ELSE
+      CALL tw_graded_panels(half,half,MIN(hp(k+1),half),edges,ne)
+    END IF
+    DO ip=1,ne
+      DO ig=1,8 ! Two 4-point rules per panel
+        h=edges(ip-1)+0.5d0*(tw_gl4_x(MOD(ig-1,4)+1)+(ig-1)/4)*(edges(ip)-edges(ip-1))
+        x=a0+(sp(k)+side*half+h)*ua
+        val=val+0.5d0*tw_gl4_w(MOD(ig-1,4)+1)*(edges(ip)-edges(ip-1))*tw_seg_lineint(x,b0,ub,lb,c2)
+      END DO
+    END DO
   END DO
 END DO
 END FUNCTION tw_seg_seg_int
@@ -1016,7 +1096,7 @@ INTEGER(i4), INTENT(in) :: na !< Number of points of polygon A
 REAL(r8), INTENT(in) :: pa(3,na) !< Points of polygon A
 INTEGER(i4), INTENT(in) :: nb !< Number of points of polygon B
 REAL(r8), INTENT(in) :: pb(3,nb) !< Points of polygon B
-REAL(r8), INTENT(in) :: c2 !< Softening c^2 (> 0)
+REAL(r8), INTENT(in) :: c2 !< Softening c^2 (0 for 1/|r|)
 REAL(r8) :: val,ua(3),la,ma(3),q,d2,lmax,acc,x(3)
 REAL(r8), ALLOCATABLE :: ub(:,:),lb(:),mb(:,:)
 INTEGER(i4) :: ia,ib,n,ig
@@ -1112,34 +1192,68 @@ END FUNCTION tw_tri_seg_int
 !---------------------------------------------------------------------------------
 !> Integral along a straight segment of the exact vector potential kernel of a circular coil,
 !! \f$ \int_{seg} \hat{u} \cdot \oint d\mathbf{l}'/|r-r'| \, dl \f$ (@ref tw_ring_avec), by Gauss-Legendre on panels
-!! graded toward the point of the segment closest to the coil
+!! graded toward the point of the segment closest to the coil (nearest of nine samples, refined by golden-section
+!! search between its neighbours)
+!!
+!! With `c2`, the kernel is softened to \f$ 1/\sqrt{|r-r'|^2+c^2} \f$ (wire radius), which for a circular coil is the
+!! exact kernel with the height difference \f$ dz \f$ replaced by \f$ \sqrt{dz^2+c^2} \f$.
 !---------------------------------------------------------------------------------
-FUNCTION tw_ring_seg_int(rz,a,b) RESULT(val)
+FUNCTION tw_ring_seg_int(rz,a,b,c2) RESULT(val)
 REAL(r8), INTENT(in) :: rz(2) !< Radius and height of the coil
 REAL(r8), INTENT(in) :: a(3) !< Start of segment
 REAL(r8), INTENT(in) :: b(3) !< End of segment
-REAL(r8) :: val,u(3),lb,s,d,dk,h,y(3),edges(0:2*tw_max_grade+2)
-INTEGER(i4) :: ne,ip,ig,k
+REAL(r8), OPTIONAL, INTENT(in) :: c2 !< Softening c^2 (default 0)
+REAL(r8) :: val,u(3),lb,s,d,dk,h,y(3),edges(0:2*tw_max_grade+2),cc,tl,tr,t1,t2,f1,f2
+REAL(r8), PARAMETER :: gr=0.6180339887498949d0
+INTEGER(i4) :: ne,ip,ig,k,ks
+cc=0.d0
+IF(PRESENT(c2))cc=c2
 lb=SQRT(SUM((b-a)**2))
 val=0.d0
 IF(lb<=0.d0)RETURN
 u=(b-a)/lb
-d=1.d99; s=0.d0
+d=1.d99; s=0.d0; ks=0
 DO k=0,8
-  y=a+(k/8.d0)*(b-a)
-  dk=SQRT((SQRT(y(1)**2+y(2)**2)-rz(1))**2+(y(3)-rz(2))**2)
+  dk=ring_dist(k/8.d0)
   IF(dk<d)THEN
-    d=dk; s=(k/8.d0)*lb
+    d=dk; s=(k/8.d0)*lb; ks=k
   END IF
 END DO
-h=MAX(0.5d0*d,1.d-6*lb)
+!---Closest point between the neighbouring samples
+tl=MAX(0,ks-1)/8.d0; tr=MIN(8,ks+1)/8.d0
+t1=tr-gr*(tr-tl); t2=tl+gr*(tr-tl)
+f1=ring_dist(t1); f2=ring_dist(t2)
+DO k=1,60
+  IF((tr-tl)*lb<=MAX(0.05d0*MIN(f1,f2),1.d-9*lb))EXIT
+  IF(f1<f2)THEN
+    tr=t2; t2=t1; f2=f1
+    t1=tr-gr*(tr-tl); f1=ring_dist(t1)
+  ELSE
+    tl=t1; t1=t2; f1=f2
+    t2=tl+gr*(tr-tl); f2=ring_dist(t2)
+  END IF
+END DO
+dk=ring_dist((tl+tr)/2.d0)
+IF(dk<d)THEN
+  d=dk; s=lb*(tl+tr)/2.d0
+END IF
+h=MAX(0.5d0*SQRT(d*d+cc),1.d-6*lb)
 CALL tw_graded_panels(lb,s,h,edges,ne)
 DO ip=1,ne
   DO ig=1,4
     y=a+(edges(ip-1)+tw_gl4_x(ig)*(edges(ip)-edges(ip-1)))*u
+    IF(cc>0.d0)y(3)=rz(2)+SIGN(SQRT((y(3)-rz(2))**2+cc),y(3)-rz(2))
     val=val+tw_gl4_w(ig)*(edges(ip)-edges(ip-1))*DOT_PRODUCT(u,tw_ring_avec(rz,y))
   END DO
 END DO
+CONTAINS
+!---Distance from the point at fraction t of the segment to the coil
+PURE FUNCTION ring_dist(t) RESULT(dist)
+REAL(r8), INTENT(in) :: t
+REAL(r8) :: dist,yt(3)
+yt=a+t*(b-a)
+dist=SQRT((SQRT(yt(1)**2+yt(2)**2)-rz(1))**2+(yt(3)-rz(2))**2)
+END FUNCTION ring_dist
 END FUNCTION tw_ring_seg_int
 !---------------------------------------------------------------------------------
 !> Element-segment kernel \f$ \int_{cell} \int_{seg} dl\,dA / |r-r'| \f$ for a straight coil segment [a,b]
@@ -1221,32 +1335,34 @@ gptr(1:ngroup)=gs(1:nout); gptr(ngroup+1)=n+1
 DEALLOCATE(stack,gs,idx,vals)
 END SUBROUTINE tw_cluster_points
 !---------------------------------------------------------------------------------
-!> Couplings of the cells to coils given as points: \f$ V_c = \sum_k s_k \sum_{seg} K(c,seg)\,\hat{u}_{seg} \f$
+!> Couplings of the elements to coil filaments given as points, added to the element-coil matrix
 !!
+!! For each cell group the cell sums \f$ V_c = \sum_k s_k \sum_{seg} K(c,seg)\,\hat{u}_{seg} \f$ over the filaments
+!! of each coil set are formed, dotted with the cell basis (`qbasis`) and added to the element and hole rows of `A`.
 !! Cells are grouped spatially and each coil filament is cut into chunks of consecutive segments. Blocks of a cell
 !! group and a chunk that are well separated use an ACA approximation of K; the others, and blocks where ACA does
 !! not converge at low rank, are summed directly with @ref tw_cell_seg_kernel.
 !---------------------------------------------------------------------------------
-SUBROUTINE tw_coil_poly_sum(tw_obj,coils_tot,ncoils_tot,ring_ok,pidx,V,nrad_cross)
+SUBROUTINE tw_coil_poly_sum(tw_obj,coils_tot,ncoils_tot,ring_ok,pidx,npset,cent,glist,gptr,ngroup,A,nrad_cross)
 TYPE(tw_type), INTENT(in) :: tw_obj !< Thin-wall model object
 TYPE(tw_coil_set), INTENT(in) :: coils_tot(:) !< All coil sets
 INTEGER(i4), INTENT(in) :: ncoils_tot !< Number of coil sets
 LOGICAL, INTENT(in) :: ring_ok(:,:) !< Circular filaments (skipped)
-INTEGER(i4), INTENT(in) :: pidx(:) !< Index of each coil set in V (0: no point-list filaments)
-REAL(r8), INTENT(inout) :: V(:,:,:) !< Summed segment couplings [3,nc,:]
-INTEGER(i4), INTENT(inout) :: nrad_cross(:) !< Count of cells closer than the coil radius
-INTEGER(i4) :: i,j,k,c,g,ngroup,nch,s,m,nseg,ic,jc
-INTEGER(i4), ALLOCATABLE :: glist(:),gptr(:),ch(:,:)
+INTEGER(i4), INTENT(in) :: pidx(:) !< Index of each coil set among the sets with point-list filaments (0: none)
+INTEGER(i4), INTENT(in) :: npset !< Number of coil sets with point-list filaments
+REAL(r8), INTENT(in) :: cent(:,:) !< Cell centroids [3,nc]
+INTEGER(i4), INTENT(in) :: glist(:) !< Cells ordered by group (@ref tw_cluster_points)
+INTEGER(i4), INTENT(in) :: gptr(:) !< Start of each group in glist
+INTEGER(i4), INTENT(in) :: ngroup !< Number of cell groups
+REAL(r8), INTENT(inout) :: A(:,:) !< Element-coil coupling [nelems_exp,ncoils_tot]
+INTEGER(i4), INTENT(inout) :: nrad_cross(:) !< Count of cells closer to a filament than its wire radius
+INTEGER(i4) :: i,j,k,c,g,nch,s,m,nseg,ic,ng
+INTEGER(i4), ALLOCATABLE :: ch(:,:)
 REAL(r8) :: dl_min,val,u(3),pts_c(3,3)
-REAL(r8), ALLOCATABLE :: cent(:,:),gcen(:,:),gext(:),ccen(:,:),cext(:)
+REAL(r8), ALLOCATABLE :: gcen(:,:),gext(:),ccen(:,:),cext(:),Vg(:,:,:)
 CLASS(oft_bmesh), POINTER :: mesh
 mesh=>tw_obj%mesh
-!---Cell groups
-ALLOCATE(cent(3,mesh%nc),glist(mesh%nc))
-DO i=1,mesh%nc
-  cent(:,i)=SUM(mesh%r(:,mesh%lc(:,i)),DIM=2)/3.d0
-END DO
-CALL tw_cluster_points(cent,tw_coil_group_size,glist,gptr,ngroup)
+!---Cell groups: centre and extent
 ALLOCATE(gcen(3,ngroup),gext(ngroup))
 DO g=1,ngroup
   gcen(:,g)=SUM(cent(:,glist(gptr(g):gptr(g+1)-1)),DIM=2)/REAL(gptr(g+1)-gptr(g),8)
@@ -1285,14 +1401,18 @@ DO j=1,ncoils_tot
   END DO
 END DO
 nch=c
-!---Blocks, one cell group per thread (groups do not share cells)
-!$omp parallel do schedule(dynamic,1) private(i,c,ic,jc,j,k,s,val,dl_min,u,pts_c)
+!---Blocks, one cell group per thread (groups do not share cells): sums for the group's cells, then scattered
+!$omp parallel private(g,i,c,ic,ng,j,k,s,val,dl_min,u,pts_c,Vg)
+ALLOCATE(Vg(3,MAXVAL(gptr(2:ngroup+1)-gptr(1:ngroup)),npset))
+!$omp do schedule(dynamic,1)
 DO g=1,ngroup
+  ng=gptr(g+1)-gptr(g)
+  Vg(:,1:ng,:)=0.d0
   DO c=1,nch
     j=ch(1,c); k=ch(2,c)
     IF((MIN(gptr(g+1)-gptr(g),ch(4,c)-ch(3,c)+1)>2*tw_coil_aca_rmin).AND. &
       (SQRT(SUM((gcen(:,g)-ccen(:,c))**2))/(gext(g)+cext(c))>tw_coil_aca_sep))THEN
-      IF(block_aca(g,c))CYCLE
+      IF(block_aca(g,c,Vg))CYCLE
     END IF
     DO ic=gptr(g),gptr(g+1)-1
       i=glist(ic)
@@ -1305,79 +1425,73 @@ DO g=1,ngroup
           !$omp atomic
           nrad_cross(j)=nrad_cross(j)+1
         END IF
-        V(:,i,pidx(j))=V(:,i,pidx(j))+coils_tot(j)%scales(k)*val*u/SQRT(SUM(u**2))
+        Vg(:,ic-gptr(g)+1,pidx(j))=Vg(:,ic-gptr(g)+1,pidx(j))+coils_tot(j)%scales(k)*val*u/SQRT(SUM(u**2))
       END DO
     END DO
   END DO
+  CALL scatter_group(g,ng,Vg)
 END DO
-DEALLOCATE(cent,glist,gptr,gcen,gext,ch,ccen,cext)
+!$omp end do
+DEALLOCATE(Vg)
+!$omp end parallel
+DEALLOCATE(gcen,gext,ch,ccen,cext)
 CONTAINS
-!> Kernel between cell glist(ic) and segment s of the chunk's filament
-FUNCTION kern(ic,jc,cc) RESULT(kv)
-INTEGER(i4), INTENT(in) :: ic,jc,cc
-REAL(r8) :: kv,dm,pc(3,3)
-INTEGER(i4) :: ci
-ci=glist(ic)
-pc(:,1)=mesh%r(:,mesh%lc(1,ci)); pc(:,2)=mesh%r(:,mesh%lc(2,ci)); pc(:,3)=mesh%r(:,mesh%lc(3,ci))
-kv=tw_cell_seg_kernel(pc,mesh%ca(ci),coils_tot(ch(1,cc))%coils(ch(2,cc))%pts(:,jc), &
-  coils_tot(ch(1,cc))%coils(ch(2,cc))%pts(:,jc+1),dm)
-END FUNCTION kern
-!> ACA (partial pivoting) of K(group, chunk), then V += scale U (W^T D) with D the segment directions;
-!! .FALSE. if not converged at low rank
-FUNCTION block_aca(gg,cc) RESULT(success)
+!---Couplings of the group's cells (V dotted with the cell basis) added to the element and hole rows
+SUBROUTINE scatter_group(gg,nn,Vgg)
+INTEGER(i4), INTENT(in) :: gg,nn
+REAL(r8), INTENT(in) :: Vgg(:,:,:)
+INTEGER(i4) :: ii,ci,jj,ik,jset,ih
+REAL(r8) :: t
+DO ii=1,nn
+  ci=glist(gptr(gg)+ii-1)
+  DO jset=1,ncoils_tot
+    IF(pidx(jset)==0)CYCLE
+    DO jj=1,3
+      ik=tw_obj%pmap(mesh%lc(jj,ci))
+      IF(ik==0)CYCLE
+      t=DOT_PRODUCT(tw_obj%qbasis(:,jj,ci),Vgg(:,ii,pidx(jset)))
+      !$omp atomic
+      A(ik,jset)=A(ik,jset)+t
+    END DO
+    DO ih=tw_obj%kfh(ci),tw_obj%kfh(ci+1)-1
+      ik=ABS(tw_obj%lfh(1,ih))+tw_obj%np_active
+      t=SIGN(1,tw_obj%lfh(1,ih))*DOT_PRODUCT(tw_obj%qbasis(:,tw_obj%lfh(2,ih),ci),Vgg(:,ii,pidx(jset)))
+      !$omp atomic
+      A(ik,jset)=A(ik,jset)+t
+    END DO
+  END DO
+END DO
+END SUBROUTINE scatter_group
+!---ACA+ (tw_aca_plus) of K(group, chunk), then V += scale U (W D) with D the segment directions;
+!   .FALSE. if not converged at low rank
+FUNCTION block_aca(gg,cc,Vgg) RESULT(success)
 INTEGER(i4), INTENT(in) :: gg,cc
+REAL(r8), INTENT(inout) :: Vgg(:,:,:) !< Sums for the group's cells
 LOGICAL :: success
-INTEGER(i4) :: mm,nn,kk,rmax,ir,jcol,l2,s0
-LOGICAL, ALLOCATABLE :: row_used(:)
-REAL(r8) :: fro2,unrm,wnrm,piv,dvec(3)
+INTEGER(i4) :: mm,nn,kk,ir,jcol,s0
+REAL(r8) :: dvec(3)
 REAL(r8), ALLOCATABLE :: Ua(:,:),Wa(:,:),D(:,:),y(:,:)
+TYPE(tw_aca_segblock) :: src
 mm=gptr(gg+1)-gptr(gg); nn=ch(4,cc)-ch(3,cc)+1; s0=ch(3,cc)
-rmax=MIN(mm,nn)/2
-ALLOCATE(Ua(mm,rmax),Wa(nn,rmax),row_used(mm),D(nn,3))
-DO jcol=1,nn
-  dvec=coils_tot(ch(1,cc))%coils(ch(2,cc))%pts(:,s0+jcol)-coils_tot(ch(1,cc))%coils(ch(2,cc))%pts(:,s0+jcol-1)
-  D(jcol,:)=0.d0
-  IF(SUM(dvec**2)>0.d0)D(jcol,:)=dvec/SQRT(SUM(dvec**2))
-END DO
-row_used=.FALSE.; success=.FALSE.; fro2=0.d0; ir=1; kk=0
-DO l2=1,rmax
-  row_used(ir)=.TRUE.
-  DO jcol=1,nn
-    Wa(jcol,kk+1)=kern(gptr(gg)+ir-1,s0+jcol-1,cc)
-  END DO
-  IF(kk>0)Wa(:,kk+1)=Wa(:,kk+1)-MATMUL(Wa(:,1:kk),Ua(ir,1:kk))
-  jcol=MAXLOC(ABS(Wa(:,kk+1)),DIM=1)
-  piv=Wa(jcol,kk+1)
-  IF(ABS(piv)<=0.d0)THEN
-    IF(ALL(row_used))EXIT
-    ir=FINDLOC(row_used,.FALSE.,DIM=1)
-    CYCLE
-  END IF
-  Wa(:,kk+1)=Wa(:,kk+1)/piv
-  DO ir=1,mm
-    Ua(ir,kk+1)=kern(gptr(gg)+ir-1,s0+jcol-1,cc)
-  END DO
-  IF(kk>0)Ua(:,kk+1)=Ua(:,kk+1)-MATMUL(Ua(:,1:kk),Wa(jcol,1:kk))
-  kk=kk+1
-  unrm=SUM(Ua(:,kk)**2); wnrm=SUM(Wa(:,kk)**2)
-  fro2=fro2+unrm*wnrm
-  IF(kk>1)fro2=fro2+2.d0*SUM(MATMUL(TRANSPOSE(Ua(:,1:kk-1)),Ua(:,kk))*MATMUL(TRANSPOSE(Wa(:,1:kk-1)),Wa(:,kk)))
-  IF((kk>=tw_coil_aca_rmin).AND.(SQRT(unrm*wnrm)<=tw_coil_aca_tol*SQRT(ABS(fro2))))THEN
-    success=.TRUE.
-    EXIT
-  END IF
-  IF(ALL(row_used))EXIT
-  ir=MAXLOC(ABS(Ua(:,kk)),MASK=.NOT.row_used,DIM=1)
-END DO
+src%mesh=>mesh
+src%cells=glist(gptr(gg):gptr(gg+1)-1)
+src%pts=coils_tot(ch(1,cc))%coils(ch(2,cc))%pts(:,s0:s0+nn)
+!---Relative tolerance, at most MIN(mm,nn)/2 terms
+CALL tw_aca_plus(src,mm,nn,tw_coil_aca_tol,tw_coil_aca_rmin,MIN(mm,nn)/2+1,1,1,Ua,Wa,kk,rel_tol=.TRUE.)
+success=(kk>0)
 IF(success)THEN
-  ALLOCATE(y(kk,3))
-  y=MATMUL(TRANSPOSE(Wa(:,1:kk)),D)*coils_tot(ch(1,cc))%scales(ch(2,cc))
-  DO ir=1,mm
-    V(:,glist(gptr(gg)+ir-1),pidx(ch(1,cc)))=V(:,glist(gptr(gg)+ir-1),pidx(ch(1,cc)))+MATMUL(Ua(ir,1:kk),y)
+  ALLOCATE(D(nn,3),y(kk,3))
+  DO jcol=1,nn
+    dvec=src%pts(:,jcol+1)-src%pts(:,jcol)
+    D(jcol,:)=0.d0
+    IF(SUM(dvec**2)>0.d0)D(jcol,:)=dvec/SQRT(SUM(dvec**2))
   END DO
-  DEALLOCATE(y)
+  y=MATMUL(Wa,D)*coils_tot(ch(1,cc))%scales(ch(2,cc))
+  DO ir=1,mm
+    Vgg(:,ir,pidx(ch(1,cc)))=Vgg(:,ir,pidx(ch(1,cc)))+MATMUL(Ua(ir,:),y)
+  END DO
+  DEALLOCATE(Ua,Wa,D,y)
 END IF
-DEALLOCATE(Ua,Wa,row_used,D)
 END FUNCTION block_aca
 END SUBROUTINE tw_coil_poly_sum
 !---------------------------------------------------------------------------------
@@ -1445,8 +1559,8 @@ REAL(r8), INTENT(in) :: pts_i(3,3) !< Vertices of the cell
 REAL(r8), INTENT(in) :: area_i !< Area of the cell
 REAL(r8), INTENT(in) :: evec_i(3,3) !< Basis function directions of the cell
 REAL(r8), INTENT(in) :: rz(3) !< Radius, height and orientation of the coil
-REAL(r8), INTENT(in) :: radius !< Coil radius (for the intersection check)
-LOGICAL, INTENT(out) :: crossed !< Cell closer to the coil than its radius?
+REAL(r8), INTENT(in) :: radius !< Wire radius of the filament (for the intersection check)
+LOGICAL, INTENT(out) :: crossed !< Cell closer to the filament than its wire radius?
 REAL(r8) :: t3(3),dl_min,dl_max,dring,pt_i(3),avec(3)
 INTEGER(i4) :: ii,jj,iquad
 dl_min=1.d99
@@ -1482,29 +1596,28 @@ END FUNCTION tw_cell_ring_kernel
 !> Couplings of the elements to circular coil filaments, added to the element-coil matrix
 !!
 !! Cells are grouped spatially and the ring filaments are clustered in the (R,Z) plane. A block of a cell group and a
-!! ring cluster that are well separated in (R,Z) uses an ACA approximation \f$ U W^T \f$ of the cell-basis by ring
-!! kernel, summed per coil set as \f$ U (W^T S) \f$ with S the filament scales; the others are evaluated directly.
+!! ring cluster that are well separated in (R,Z) uses an ACA approximation \f$ U W \f$ of the cell-basis by ring
+!! kernel, summed per coil set as \f$ U (W S) \f$ with S the filament scales; the others are evaluated directly.
 !---------------------------------------------------------------------------------
-SUBROUTINE tw_coil_ring_sum(tw_obj,coils_tot,ncoils_tot,ring_ok,ring_rz,A,nrad_cross)
+SUBROUTINE tw_coil_ring_sum(tw_obj,coils_tot,ncoils_tot,ring_ok,ring_rz,cent,glist,gptr,ngroup,A,nrad_cross)
 TYPE(tw_type), INTENT(in) :: tw_obj !< Thin-wall model object
 TYPE(tw_coil_set), INTENT(in) :: coils_tot(:) !< All coil sets
 INTEGER(i4), INTENT(in) :: ncoils_tot !< Number of coil sets
 LOGICAL, INTENT(in) :: ring_ok(:,:) !< Circular filaments
 REAL(r8), INTENT(in) :: ring_rz(:,:,:) !< Radius, height and orientation of each filament
+REAL(r8), INTENT(in) :: cent(:,:) !< Cell centroids [3,nc]
+INTEGER(i4), INTENT(in) :: glist(:) !< Cells ordered by group (@ref tw_cluster_points)
+INTEGER(i4), INTENT(in) :: gptr(:) !< Start of each group in glist
+INTEGER(i4), INTENT(in) :: ngroup !< Number of cell groups
 REAL(r8), INTENT(inout) :: A(:,:) !< Element-coil coupling [nelems_exp,ncoils_tot]
-INTEGER(i4), INTENT(inout) :: nrad_cross(:) !< Count of cells closer than the coil radius
-INTEGER(i4) :: i,j,k,g,c,p,ii,nring,ngroup,nchunk
-INTEGER(i4), ALLOCATABLE :: glist(:),gptr(:),rlist(:),rptr(:),rset(:),rfil(:)
+INTEGER(i4), INTENT(inout) :: nrad_cross(:) !< Count of cells closer to a filament than its wire radius
+INTEGER(i4) :: i,j,k,g,c,p,ii,nring,nchunk
+INTEGER(i4), ALLOCATABLE :: rlist(:),rptr(:),rset(:),rfil(:)
 REAL(r8) :: rho
-REAL(r8), ALLOCATABLE :: cent(:,:),rcen(:,:),grz(:,:),gext(:),crz(:,:),cext(:)
+REAL(r8), ALLOCATABLE :: rcen(:,:),grz(:,:),gext(:),crz(:,:),cext(:)
 CLASS(oft_bmesh), POINTER :: mesh
 mesh=>tw_obj%mesh
-!---Cell groups and their (R,Z) centre and extent
-ALLOCATE(cent(3,mesh%nc),glist(mesh%nc))
-DO i=1,mesh%nc
-  cent(:,i)=SUM(mesh%r(:,mesh%lc(:,i)),DIM=2)/3.d0
-END DO
-CALL tw_cluster_points(cent,tw_coil_group_size,glist,gptr,ngroup)
+!---Cell groups: (R,Z) centre and extent
 ALLOCATE(grz(2,ngroup),gext(ngroup))
 DO g=1,ngroup
   grz(:,g)=0.d0
@@ -1553,9 +1666,9 @@ DO p=1,nchunk*ngroup
   g=MOD(p-1,ngroup)+1
   CALL ring_block(c,g)
 END DO
-DEALLOCATE(cent,glist,gptr,grz,gext,rset,rfil,rcen,rlist,rptr,crz,cext)
+DEALLOCATE(grz,gext,rset,rfil,rcen,rlist,rptr,crz,cext)
 CONTAINS
-!> Kernel triple of cell glist(ic) and ring filament rlist(ir)
+!---Kernel triple of cell glist(ic) and ring filament rlist(ir)
 FUNCTION kern3(ic,ir,crossed) RESULT(t3)
 INTEGER(i4), INTENT(in) :: ic,ir
 LOGICAL, INTENT(out) :: crossed
@@ -1566,7 +1679,7 @@ pc(:,1)=mesh%r(:,mesh%lc(1,ci)); pc(:,2)=mesh%r(:,mesh%lc(2,ci)); pc(:,3)=mesh%r
 t3=tw_cell_ring_kernel(pc,mesh%ca(ci),tw_obj%qbasis(:,:,ci),ring_rz(:,rfil(rr),rset(rr)), &
   coils_tot(rset(rr))%radius(rfil(rr)),crossed)
 END FUNCTION kern3
-!> One block: ACA when separated, otherwise direct; summed per coil set and scattered to the elements
+!---One block: ACA when separated, otherwise direct; summed per coil set and scattered to the elements
 SUBROUTINE ring_block(cc,gg)
 INTEGER(i4), INTENT(in) :: cc,gg
 INTEGER(i4) :: m,n,nsl,ic,ir,jj,ik,ii2,ci,rr
@@ -1630,74 +1743,53 @@ DO ic=1,m
 END DO
 DEALLOCATE(lset,sglob,B,S)
 END SUBROUTINE ring_block
-!> ACA (partial pivoting) of the 3m x n block of cell group gg and ring cluster cc, B = U (W^T S); .FALSE. if not
-!! converged at low rank
+!---ACA+ (tw_aca_plus) of the 3m x n block of cell group gg and ring cluster cc, B = U (W S); .FALSE. if not
+!   converged at low rank
 FUNCTION ring_aca(cc,gg,mm,nn,nsl,S,B) RESULT(success)
 INTEGER(i4), INTENT(in) :: cc,gg,mm,nn,nsl
 REAL(r8), INTENT(in) :: S(nn,nsl)
 REAL(r8), INTENT(inout) :: B(3*mm,nsl)
 LOGICAL :: success
-INTEGER(i4) :: kk,rmax,irow,jcol,l2,jc,ic2
-LOGICAL :: cr
-LOGICAL, ALLOCATABLE :: row_used(:)
-REAL(r8) :: fro2,unrm,wnrm,piv,tt(3)
+INTEGER(i4) :: kk,ic2,jc,rr
 REAL(r8), ALLOCATABLE :: Ua(:,:),Wa(:,:)
-rmax=MIN(3*mm,nn)/2
-ALLOCATE(Ua(3*mm,rmax),Wa(nn,rmax),row_used(3*mm))
-row_used=.FALSE.; success=.FALSE.; fro2=0.d0; irow=1; kk=0
-DO l2=1,rmax
-  row_used(irow)=.TRUE.
-  ic2=(irow-1)/3+1
-  DO jc=1,nn
-    tt=kern3(gptr(gg)+ic2-1,rptr(cc)+jc-1,cr)
-    Wa(jc,kk+1)=tt(irow-3*(ic2-1))
-  END DO
-  IF(kk>0)Wa(:,kk+1)=Wa(:,kk+1)-MATMUL(Wa(:,1:kk),Ua(irow,1:kk))
-  jcol=MAXLOC(ABS(Wa(:,kk+1)),DIM=1)
-  piv=Wa(jcol,kk+1)
-  IF(ABS(piv)<=0.d0)THEN
-    IF(ALL(row_used))EXIT
-    irow=FINDLOC(row_used,.FALSE.,DIM=1)
-    CYCLE
-  END IF
-  Wa(:,kk+1)=Wa(:,kk+1)/piv
-  DO ic2=1,mm
-    Ua(3*ic2-2:3*ic2,kk+1)=kern3(gptr(gg)+ic2-1,rptr(cc)+jcol-1,cr)
-  END DO
-  IF(kk>0)Ua(:,kk+1)=Ua(:,kk+1)-MATMUL(Ua(:,1:kk),Wa(jcol,1:kk))
-  kk=kk+1
-  unrm=SUM(Ua(:,kk)**2); wnrm=SUM(Wa(:,kk)**2)
-  fro2=fro2+unrm*wnrm
-  IF(kk>1)fro2=fro2+2.d0*SUM(MATMUL(TRANSPOSE(Ua(:,1:kk-1)),Ua(:,kk))*MATMUL(TRANSPOSE(Wa(:,1:kk-1)),Wa(:,kk)))
-  IF((kk>=tw_coil_aca_rmin).AND.(SQRT(unrm*wnrm)<=tw_coil_aca_tol*SQRT(ABS(fro2))))THEN
-    success=.TRUE.
-    EXIT
-  END IF
-  IF(ALL(row_used))EXIT
-  irow=MAXLOC(ABS(Ua(:,kk)),MASK=.NOT.row_used,DIM=1)
+TYPE(tw_aca_ringblock) :: src
+src%mesh=>mesh
+src%cells=glist(gptr(gg):gptr(gg+1)-1)
+ALLOCATE(src%qbasis(3,3,mm),src%rz(3,nn),src%radius(nn))
+DO ic2=1,mm
+  src%qbasis(:,:,ic2)=tw_obj%qbasis(:,:,src%cells(ic2))
 END DO
-IF(success)B=MATMUL(Ua(:,1:kk),MATMUL(TRANSPOSE(Wa(:,1:kk)),S))
-DEALLOCATE(Ua,Wa,row_used)
+DO jc=1,nn
+  rr=rlist(rptr(cc)+jc-1)
+  src%rz(:,jc)=ring_rz(:,rfil(rr),rset(rr))
+  src%radius(jc)=coils_tot(rset(rr))%radius(rfil(rr))
+END DO
+!---Relative tolerance, at most MIN(3*mm,nn)/2 terms
+CALL tw_aca_plus(src,3*mm,nn,tw_coil_aca_tol,tw_coil_aca_rmin,MIN(3*mm,nn)/2+1,1,1,Ua,Wa,kk,rel_tol=.TRUE.)
+success=(kk>0)
+IF(success)THEN
+  B=MATMUL(Ua,MATMUL(Wa,S))
+  DEALLOCATE(Ua,Wa)
+END IF
 END FUNCTION ring_aca
 END SUBROUTINE tw_coil_ring_sum
 !---------------------------------------------------------------------------------
-!> Compute element to driver (Icoils) coupling matrix
+!> Compute the element to coil coupling matrices, V-coils (`Ael2coil`) and I-coils (`Ael2dr`)
 !!
-!! Circular coils about the Z axis are integrated with the exact vector potential of a ring (elliptic integrals)
-!! where they are well separated from an element; otherwise the coil polygon is integrated point by point.
+!! Circular coils about the Z axis use the exact vector potential of a ring (elliptic integrals), integrated along
+!! the true circle for cells close to the coil (@ref tw_coil_ring_sum). Coils given as points use exact segment
+!! integrals, with ACA over groups of cells (@ref tw_coil_poly_sum).
 !---------------------------------------------------------------------------------
 SUBROUTINE tw_compute_Ael2dr_exp(tw_obj,save_file)
 TYPE(tw_type), INTENT(inout) :: tw_obj !< Thin-wall model object
 CHARACTER(LEN=*), OPTIONAL, INTENT(in) :: save_file
 LOGICAL :: exists
-INTEGER(4) :: i,ii,j,jj,k,kk,ik,ncoils_tot,ih,ihp,ihc,file_counts(4),ierr,io_unit,iquad
+INTEGER(4) :: i,j,k,ncoils_tot,file_counts(4),ierr,io_unit
 INTEGER(i4), ALLOCATABLE :: nrad_cross(:)
-REAL(8) :: tmp(3),cvec(3),cpt(3),pt_i(3),evec_i(3,3),pts_i(3,3),elapsed_time
-REAL(8) :: pot_tmp,rgop(3,3),area_i,norm_i(3),f(3),dl_min,dl_max,pot_last
-REAL(8) :: avec(3),dring,useg(3),seg_len,dseg
-INTEGER(4) :: npset
-INTEGER(4), ALLOCATABLE :: pidx(:)
-REAL(8), allocatable :: atmp(:,:),Ael2coil_tmp(:,:),ring_rz(:,:,:),Vpoly(:,:,:)
+REAL(8) :: elapsed_time
+INTEGER(4) :: npset,ngroup
+INTEGER(4), ALLOCATABLE :: pidx(:),glist(:),gptr(:)
+REAL(8), allocatable :: Ael2coil_tmp(:,:),ring_rz(:,:,:),cent(:,:)
 LOGICAL, ALLOCATABLE :: ring_ok(:,:)
 CLASS(oft_bmesh), POINTER :: bmesh
 TYPE(tw_coil_set), POINTER, DIMENSION(:) :: coils_tot
@@ -1799,57 +1891,18 @@ DO j=1,ncoils_tot
     pidx(j)=npset
   END IF
 END DO
-ALLOCATE(Vpoly(3,bmesh%nc,MAX(1,npset)))
-Vpoly=0.d0
-IF(npset>0)CALL tw_coil_poly_sum(tw_obj,coils_tot,ncoils_tot,ring_ok,pidx,Vpoly,nrad_cross)
-Ael2coil_tmp=0.d0
-IF(ANY(ring_ok))CALL tw_coil_ring_sum(tw_obj,coils_tot,ncoils_tot,ring_ok,ring_rz,Ael2coil_tmp,nrad_cross)
-IF(npset>0)THEN
-f=1.d0/3.d0
-!$omp parallel private(ii,ik,j,jj,k,kk,pts_i,pt_i,cvec, &
-!$omp cpt,tmp,atmp,evec_i,pot_tmp,pot_last,i,ih,ihp, &
-!$omp ihc,rgop,area_i,norm_i,dl_min,dl_max,iquad,avec,dring,useg,seg_len,dseg)
-ALLOCATE(atmp(ncoils_tot,3))
-!$omp do
+!---Cell groups, shared by the polygon and circular coil sums
+ALLOCATE(cent(3,bmesh%nc),glist(bmesh%nc))
 DO i=1,bmesh%nc
-  ! CALL bmesh%jacobian(i,f,rgop,area_i)
-  ! CALL bmesh%norm(i,f,norm_i)
-  area_i=bmesh%ca(i)
-  DO ii=1,3
-    pts_i(:,ii)=bmesh%r(:,bmesh%lc(ii,i))
-    ! evec_i(:,ii)=cross_product(rgop(:,ii),norm_i)
-    evec_i(:,ii)=tw_obj%qbasis(:,ii,i)
-  END DO
-  !---Compute driver contributions
-  !---Coils given as points (circular coils are added by tw_coil_ring_sum)
-  atmp=0.d0
-  DO j=1,ncoils_tot
-    IF(pidx(j)>0)THEN
-      DO jj=1,3
-        atmp(j,jj)=atmp(j,jj)+DOT_PRODUCT(evec_i(:,jj),Vpoly(:,i,pidx(j)))
-      END DO
-    END IF
-  END DO
-  DO ii=1,3
-    ik=tw_obj%pmap(bmesh%lc(ii,i))
-    IF(ik==0)CYCLE
-    DO j=1,ncoils_tot
-      !$omp atomic
-      Ael2coil_tmp(ik,j) = Ael2coil_tmp(ik,j) + atmp(j,ii)
-    END DO
-  END DO
-  DO ii=tw_obj%kfh(i),tw_obj%kfh(i+1)-1
-    ik=ABS(tw_obj%lfh(1,ii))+tw_obj%np_active
-    DO j=1,ncoils_tot
-      tmp(1)=SIGN(1,tw_obj%lfh(1,ii))*atmp(j,tw_obj%lfh(2,ii))
-      !$omp atomic
-      Ael2coil_tmp(ik,j) = Ael2coil_tmp(ik,j) + tmp(1)
-    END DO
-  END DO
+  cent(:,i)=SUM(bmesh%r(:,bmesh%lc(:,i)),DIM=2)/3.d0
 END DO
-DEALLOCATE(atmp)
-!$omp end parallel
-END IF
+CALL tw_cluster_points(cent,tw_coil_group_size,glist,gptr,ngroup)
+Ael2coil_tmp=0.d0
+IF(npset>0)CALL tw_coil_poly_sum(tw_obj,coils_tot,ncoils_tot,ring_ok,pidx,npset,cent,glist,gptr,ngroup, &
+  Ael2coil_tmp,nrad_cross)
+IF(ANY(ring_ok))CALL tw_coil_ring_sum(tw_obj,coils_tot,ncoils_tot,ring_ok,ring_rz,cent,glist,gptr,ngroup, &
+  Ael2coil_tmp,nrad_cross)
+DEALLOCATE(cent,glist,gptr)
 IF(ANY(nrad_cross(1:tw_obj%n_vcoils)>0))THEN
   CALL oft_warn("One or more elements intersect a Vcoil within its radius, which may lead to invalid inductance values.")
   DO j=1,tw_obj%n_vcoils
@@ -1867,7 +1920,7 @@ DO i=1,tw_obj%n_icoils
   tw_obj%Ael2dr(:,i)=Ael2coil_tmp(:,i+tw_obj%n_vcoils)
 END DO
 !---Cleanup temporaries
-DEALLOCATE(Ael2coil_tmp,coils_tot,ring_ok,ring_rz,pidx,Vpoly)
+DEALLOCATE(Ael2coil_tmp,coils_tot,ring_ok,ring_rz,pidx)
 elapsed_time=mytimer%tock()
 WRITE(*,'(3A)')oft_indent,'Time = ',time_to_string(elapsed_time)
 CALL oft_decrease_indent
@@ -1887,7 +1940,11 @@ END IF
 DEBUG_STACK_POP
 END SUBROUTINE tw_compute_Ael2dr_exp
 !---------------------------------------------------------------------------------
-!> Compute coupling from thin-wall model elements to flux loop sensors
+!> Compute the mutual inductances between coils (`Acoil2coil` for V-coils, and the V-coil to I-coil couplings)
+!!
+!! The work is split over filament pairs. Coaxial circular coils use the exact ring-ring mutual, circular coils and
+!! polygons the exact ring kernel along each polygon segment (@ref tw_ring_seg_int), and polygon pairs exact
+!! segment pair integrals for near segments and Gauss-Legendre for far ones (@ref tw_poly_poly_int).
 !!
 !! @note The asymptotic form of self-inductance for thin circular coils derived
 !! by Hurwitz and Landreman [arXiv:2310.09313 (2023)] is used for all inductance
@@ -1896,12 +1953,11 @@ END SUBROUTINE tw_compute_Ael2dr_exp
 !---------------------------------------------------------------------------------
 SUBROUTINE tw_compute_Lmat_coils(tw_obj)
 TYPE(tw_type), INTENT(inout) :: tw_obj !< Thin-wall model object
-LOGICAL :: exists
-INTEGER(4) :: i,ii,j,jj,k,kk,l,ik,jk,ih,ihp,ihc,file_counts(4),ierr,io_unit,iquad
-REAL(8) :: tmp,dl,pt_j(3),evec_i(3,3),evec_j(3,3),pts_i(3,3)
-REAL(8) :: rvec_i(3),r1,rmag,rvec_j(3),z1,cvec(3),coil_thickness,sqrt_e
-REAL(8) :: rgop(3,3),norm_i(3),area_i,dl_min,dl_max,elapsed_time
-REAL(8), allocatable :: atmp(:,:),Acoil2sen_tmp(:,:),Acoil2coil_tmp(:,:),ring_rz(:,:,:)
+INTEGER(4) :: i,ii,j,jj,k,kk,l
+REAL(8) :: tmp
+REAL(8) :: coil_thickness,sqrt_e
+REAL(8) :: elapsed_time
+REAL(8), allocatable :: atmp(:,:),Acoil2coil_tmp(:,:),ring_rz(:,:,:)
 LOGICAL, ALLOCATABLE :: ring_ok(:,:)
 INTEGER(4), ALLOCATABLE :: fil(:,:)
 INTEGER(4) :: nfil,f
@@ -1978,16 +2034,18 @@ IF((tw_obj%n_vcoils>0).AND.(ncoils_tot>0))THEN
           tmp=-8.d0*pi*pi*green(ring_rz(1,i,l),SQRT((ring_rz(2,i,l)-ring_rz(2,k,j))**2+coil_thickness), &
             ring_rz(1,k,j),0.d0)*ring_rz(3,i,l)*ring_rz(3,k,j)
         ELSE IF(ring_ok(i,l).OR.ring_ok(k,j))THEN
-          !---Ring and polygon (different coils): exact integral of the ring's kernel along each polygon segment
+          !---Ring and polygon: exact integral of the ring's softened kernel along each polygon segment
           tmp=0.d0
           IF(ring_ok(i,l))THEN
             DO kk=2,coils_tot(j)%coils(k)%npts
-              tmp=tmp+tw_ring_seg_int(ring_rz(1:2,i,l),coils_tot(j)%coils(k)%pts(:,kk-1),coils_tot(j)%coils(k)%pts(:,kk))
+              tmp=tmp+tw_ring_seg_int(ring_rz(1:2,i,l),coils_tot(j)%coils(k)%pts(:,kk-1),coils_tot(j)%coils(k)%pts(:,kk), &
+                coil_thickness)
             END DO
             tmp=tmp*ring_rz(3,i,l)
           ELSE
             DO ii=2,coils_tot(l)%coils(i)%npts
-              tmp=tmp+tw_ring_seg_int(ring_rz(1:2,k,j),coils_tot(l)%coils(i)%pts(:,ii-1),coils_tot(l)%coils(i)%pts(:,ii))
+              tmp=tmp+tw_ring_seg_int(ring_rz(1:2,k,j),coils_tot(l)%coils(i)%pts(:,ii-1),coils_tot(l)%coils(i)%pts(:,ii), &
+                coil_thickness)
             END DO
             tmp=tmp*ring_rz(3,k,j)
           END IF
@@ -2581,19 +2639,22 @@ CALL oft_decrease_indent
 DEBUG_STACK_POP
 END SUBROUTINE tw_compute_Lmat_MF_exp
 !---------------------------------------------------------------------------------
-!> Compute coupling from thin-wall model elements to flux loop sensors
+!> Compute coupling from thin-wall model elements and coils to sensors (flux loops and point Mirnov probes)
+!!
+!! Flux loops use the flux of each element and coil through the loop; point probes use the field along the probe
+!! normal at its point.
 !---------------------------------------------------------------------------------
 SUBROUTINE tw_compute_mutuals_exp(tw_obj,nsensors,sensors,save_file)
 TYPE(tw_type), INTENT(inout) :: tw_obj !< Thin-wall model object
-INTEGER(4), INTENT(in) :: nsensors !< Number of flux loops
-TYPE(floop_sensor), POINTER, INTENT(in) :: sensors(:) !< List of flux loops
+INTEGER(4), INTENT(in) :: nsensors !< Number of sensors
+TYPE(floop_sensor), POINTER, INTENT(in) :: sensors(:) !< List of sensors (flux loops and point probes)
 CHARACTER(LEN=*), OPTIONAL, INTENT(in) :: save_file
 LOGICAL :: exists
-INTEGER(4) :: i,ii,j,jj,k,kk,l,ik,jk,ih,ihp,ihc,file_counts(5),ierr,io_unit,iquad,sens_hash,npoint
-REAL(8) :: tmp,dl,pt_i(3),pt_j(3),evec_i(3,3),evec_j(3,3),pts_i(3,3),pt_i_last(3),bpt(3,3)
-REAL(8) :: rvec_i(3),r1,rmag,rvec_j(3),z1,cvec(3),cpt(3),coil_thickness,elapsed_time
-REAL(8) :: rgop(3,3),norm_i(3),area_i,f(3),dl_min,dl_max,pot_last,pot_tmp
-REAL(8), allocatable :: atmp(:,:),Acoil2sen_tmp(:,:),Acoil2coil_tmp(:,:)
+INTEGER(4) :: i,ii,j,jj,k,kk,ik,file_counts(5),ierr,io_unit,sens_hash,npoint
+REAL(8) :: tmp,dl,pt_i(3),evec_i(3,3),pts_i(3,3),bpt(3,3)
+REAL(8) :: rvec_j(3),cvec(3),elapsed_time
+REAL(8) :: norm_i(3),area_i,f(3),dl_min
+REAL(8), allocatable :: atmp(:,:),Acoil2sen_tmp(:,:)
 CLASS(oft_bmesh), POINTER :: bmesh
 INTEGER(4) :: ncoils_tot
 TYPE(tw_coil_set), POINTER, DIMENSION(:) :: coils_tot
@@ -2666,18 +2727,16 @@ ALLOCATE(tw_obj%Ael2sen(nsensors,tw_nelems_exp(tw_obj)))
 tw_obj%Ael2sen=0.d0
 IF(nsensors>0)THEN
   CALL mytimer%tick()
-  !$omp parallel private(ii,j,jj,ik,pts_i,tmp,pt_i,pt_j,evec_i,rvec_j, &
-  !$omp atmp,i,ih,ihp,ihc,rgop,area_i,norm_i,dl_min,dl_max,pot_last,iquad,bpt,dl)
+  !$omp parallel private(ii,j,jj,ik,pts_i,tmp,pt_i,evec_i,rvec_j, &
+  !$omp atmp,i,area_i,norm_i,dl_min,bpt,dl)
   ALLOCATE(atmp(3,nsensors))
   !$omp do
   DO i=1,bmesh%nc
     IF(tw_obj%sens_mask(bmesh%reg(i)))CYCLE
-    ! CALL bmesh%jacobian(i,f,rgop,area_i)
     ! CALL bmesh%norm(i,f,norm_i)
     area_i=bmesh%ca(i)
     DO ii=1,3
       pts_i(:,ii)=bmesh%r(:,bmesh%lc(ii,i))
-      ! evec_i(:,ii)=cross_product(rgop(:,ii),norm_i)
       evec_i(:,ii)=tw_obj%qbasis(:,ii,i)
     END DO
     !---Compute sensor couplings
@@ -2746,7 +2805,7 @@ WRITE(*,'(2A)')oft_indent,'Building coil->sensor inductance matrix'
 CALL oft_increase_indent
 IF(nsensors>0.AND.ncoils_tot>0)THEN
   CALL mytimer%tick()
-  !$omp parallel private(ii,j,k,kk,tmp,pt_i,rvec_i,r1,rmag,atmp,cvec,cpt,pot_tmp,pt_i_last,pot_last)
+  !$omp parallel private(ii,j,k,kk,tmp,pt_i,atmp,cvec)
   ALLOCATE(atmp(ncoils_tot,1))
   !$omp do
   DO i=1,nsensors
@@ -2770,28 +2829,20 @@ IF(nsensors>0.AND.ncoils_tot>0)THEN
       Acoil2sen_tmp(i,:)=atmp(:,1)
       CYCLE
     END IF
-    !---Sensor polygon: exact integrals along each straight sensor segment
-    DO ii=2,sensors(i)%np
-      rvec_i=sensors(i)%r(:,ii)-sensors(i)%r(:,ii-1)
-      r1=SQRT(SUM(rvec_i**2))
-      IF(r1<=0.d0)CYCLE
-      DO j=1,ncoils_tot
-        IF(coils_tot(j)%sens_mask)CYCLE
-        DO k=1,coils_tot(j)%ncoils
-          IF(coils_tot(j)%coils(k)%is_ring)THEN
-            tmp=tw_ring_seg_int(coils_tot(j)%coils(k)%ring_rz,sensors(i)%r(:,ii-1),sensors(i)%r(:,ii))
-          ELSE
-            tmp=0.d0
-            DO kk=2,coils_tot(j)%coils(k)%npts
-              cvec = coils_tot(j)%coils(k)%pts(:,kk)-coils_tot(j)%coils(k)%pts(:,kk-1)
-              rmag=SQRT(SUM(cvec**2))
-              IF(rmag<=0.d0)CYCLE
-              tmp = tmp + DOT_PRODUCT(rvec_i,cvec)/(r1*rmag)*tw_seg_seg_int(sensors(i)%r(:,ii-1),sensors(i)%r(:,ii), &
-                coils_tot(j)%coils(k)%pts(:,kk-1),coils_tot(j)%coils(k)%pts(:,kk),0.d0)
-            END DO
-          END IF
-          atmp(j,1)=atmp(j,1)+coils_tot(j)%scales(k)*tmp
-        END DO
+    !---Sensor polygon: exact integrals along the straight sensor segments (near and far tiers of
+    !   @ref tw_poly_poly_int for polygon coils)
+    DO j=1,ncoils_tot
+      IF(coils_tot(j)%sens_mask)CYCLE
+      DO k=1,coils_tot(j)%ncoils
+        IF(coils_tot(j)%coils(k)%is_ring)THEN
+          tmp=0.d0
+          DO ii=2,sensors(i)%np
+            tmp=tmp+tw_ring_seg_int(coils_tot(j)%coils(k)%ring_rz,sensors(i)%r(:,ii-1),sensors(i)%r(:,ii))
+          END DO
+        ELSE
+          tmp=tw_poly_poly_int(sensors(i)%r,sensors(i)%np,coils_tot(j)%coils(k)%pts,coils_tot(j)%coils(k)%npts,0.d0)
+        END IF
+        atmp(j,1)=atmp(j,1)+coils_tot(j)%scales(k)*tmp
       END DO
     END DO
     DO j=1,ncoils_tot
@@ -2824,7 +2875,7 @@ END DO
 tw_obj%Adr2sen=tw_obj%Adr2sen*mu0/(4.d0*pi)
 !---Copy coupling between passive coils and sensors
 IF(nsensors>0)THEN
-  !$omp parallel private(j,ii,jj,ik,jk)
+  !$omp parallel private(jj)
   !$omp do
   DO i=1,tw_obj%n_vcoils
     ! Sensors
@@ -3262,14 +3313,271 @@ DO i=1,3
   ip=MOD(i,3)+1
   e=r(:,ip)-r(:,i)
   elen=SQRT(SUM(e**2))
-  num=rmag(ip)*elen + SUM(r(:,ip)*e)
-  den=rmag(i)*elen + SUM(r(:,i)*e)
-  IF(ABS(den)<1.d-14.OR.elen<1.d-14)CYCLE
+  IF(elen<1.d-14)CYCLE
   phi=phi+(nhat(1)*(r(2,i)*r(3,ip)-r(3,i)*r(2,ip)) + nhat(2)*(r(3,i)*r(1,ip)-r(1,i)*r(3,ip)) &
-    + nhat(3)*(r(1,i)*r(2,ip)-r(2,i)*r(1,ip)))*LOG(num/den)/elen
+    + nhat(3)*(r(1,i)*r(2,ip)-r(2,i)*r(1,ip)))*tw_edge_lineint(r(:,i),r(:,ip),rmag(i),rmag(ip),e,elen)/elen
 END DO
 DEBUG_STACK_POP
 END FUNCTION tw_compute_phipot
+!---------------------------------------------------------------------------------
+!> Integral of \f$ 1/|r-r'| \f$ along a straight edge from \f$ r_a \f$ to \f$ r_b \f$ (relative to the
+!! observation point), \f$ \ln((|r_b|+s_b)/(|r_a|+s_a)) \f$ with \f$ s = r \cdot \hat{e} \f$
+!!
+!! Evaluated as \f$ \ln((|r_a|-s_a)/(|r_b|-s_b)) \f$ when the point lies mostly beyond the end \f$ r_b \f$
+!! (\f$ s_a+s_b<0 \f$), where the first form cancels; both are exact, including for points on the line of the
+!! edge outside it. Zero for points on the edge itself (singular).
+!---------------------------------------------------------------------------------
+PURE FUNCTION tw_edge_lineint(ra,rb,rma,rmb,e,elen) RESULT(val)
+REAL(8), INTENT(in) :: ra(3) !< Start vertex relative to the observation point
+REAL(8), INTENT(in) :: rb(3) !< End vertex relative to the observation point
+REAL(8), INTENT(in) :: rma !< \f$ |r_a| \f$
+REAL(8), INTENT(in) :: rmb !< \f$ |r_b| \f$
+REAL(8), INTENT(in) :: e(3) !< Edge vector, rb-ra
+REAL(8), INTENT(in) :: elen !< Edge length
+REAL(8) :: val !< Line integral (0 for points on the edge)
+REAL(8) :: sa,sb,num,den
+sa=SUM(ra*e)/elen
+sb=SUM(rb*e)/elen
+IF(sa+sb>=0.d0)THEN
+  num=rmb+sb; den=rma+sa
+ELSE
+  num=rma-sa; den=rmb-sb
+END IF
+IF(MIN(num,den)<=1.d-14*(rma+rmb))THEN
+  val=0.d0
+ELSE
+  val=LOG(num/den)
+END IF
+END FUNCTION tw_edge_lineint
+!------------------------------------------------------------------------------
+!> ACA+ (adaptive cross approximation with a reference row and column) of a block given by its rows and columns
+!!
+!! Builds \f$ K \approx U V \f$ one rank-1 term at a time, each from a residual row and column chosen by partial
+!! pivoting against a reference row and column. Stops once the Frobenius norm of the latest term is below `tol`
+!! (or below `tol` times the estimated norm of the approximation, with `rel_tol`) after at least `min_its` terms.
+!! Fails (`nterms=-1`) if `max_iter-1` terms are reached first. `max_iter` is limited to `MIN(nrows,ncols)+1`, so
+!! every term has an unused pivot row and column.
+!------------------------------------------------------------------------------
+SUBROUTINE tw_aca_plus(src,nrows,ncols,tol,min_its,max_iter,Iref_in,Jref_in,U,V,nterms,rel_tol)
+CLASS(tw_aca_source), INTENT(inout) :: src !< Rows and columns of the block
+INTEGER(4), INTENT(in) :: nrows !< Number of rows
+INTEGER(4), INTENT(in) :: ncols !< Number of columns
+REAL(8), INTENT(in) :: tol !< Tolerance on the Frobenius norm of the latest term
+INTEGER(4), INTENT(in) :: min_its !< Minimum number of terms
+INTEGER(4), INTENT(in) :: max_iter !< Maximum number of iterations (at most `max_iter-1` terms)
+INTEGER(4), INTENT(in) :: Iref_in !< Initial reference row
+INTEGER(4), INTENT(in) :: Jref_in !< Initial reference column
+REAL(8), ALLOCATABLE, INTENT(out) :: U(:,:) !< Left factor (residual columns) [nrows,nterms]
+REAL(8), ALLOCATABLE, INTENT(out) :: V(:,:) !< Right factor (scaled residual rows) [nterms,ncols]
+INTEGER(4), INTENT(out) :: nterms !< Number of terms (-1 if not converged)
+LOGICAL, OPTIONAL, INTENT(in) :: rel_tol !< Is `tol` relative to the norm of the approximation?
+INTEGER(4) :: Iref,Jref,Istar,Jstar,i,k,kmax
+LOGICAL :: rel
+REAL(8) :: step_size,Istar_val,Jstar_val,fro2
+REAL(8), ALLOCATABLE :: us(:,:),vs(:,:),RIstar(:),RJstar(:),RIref(:),RJref(:)
+LOGICAL, ALLOCATABLE :: prevIstar(:),prevJstar(:)
+rel=.FALSE.
+IF(PRESENT(rel_tol))rel=rel_tol
+kmax=MIN(max_iter,MIN(nrows,ncols)+1)
+IF(kmax<2)THEN
+  nterms=-1
+  RETURN
+END IF
+ALLOCATE(us(nrows,kmax),vs(kmax,ncols))
+us=0.d0
+vs=0.d0
+nterms=0
+fro2=0.d0
+ALLOCATE(prevIstar(nrows),prevJstar(ncols))
+prevIstar=.TRUE. ! Rows not yet used as pivots
+prevJstar=.TRUE. ! Columns not yet used as pivots
+ALLOCATE(RIstar(ncols),RJstar(nrows),RIref(ncols),RJref(nrows))
+Iref=Iref_in
+Jref=Jref_in
+CALL src%row(Iref,RIref)
+CALL src%col(Jref,RJref)
+step_size=-1.d0
+DO k=1,kmax
+  !---Pivot candidates from the reference column and row
+  Jstar=tw_max_masked(ABS(RIref),prevJstar)
+  Istar=tw_max_masked(ABS(RJref),prevIstar)
+  Jstar_val=ABS(RIref(Jstar))
+  Istar_val=ABS(RJref(Istar))
+  IF(Istar_val>Jstar_val)THEN
+    !---Pivot on the row first, then the largest entry of its residual
+    CALL src%row(Istar,RIstar)
+    DO i=1,nterms
+      RIstar=RIstar-us(Istar,i)*vs(i,:)
+    END DO
+    Jstar=tw_max_masked(ABS(RIstar),prevJstar)
+    CALL src%col(Jstar,RJstar)
+    DO i=1,nterms
+      RJstar=RJstar-us(:,i)*vs(i,Jstar)
+    END DO
+  ELSE
+    !---Pivot on the column first, then the largest entry of its residual
+    CALL src%col(Jstar,RJstar)
+    DO i=1,nterms
+      RJstar=RJstar-us(:,i)*vs(i,Jstar)
+    END DO
+    Istar=tw_max_masked(ABS(RJstar),prevIstar)
+    CALL src%row(Istar,RIstar)
+    DO i=1,nterms
+      RIstar=RIstar-us(Istar,i)*vs(i,:)
+    END DO
+  END IF
+  prevIstar(Istar)=.FALSE.
+  prevJstar(Jstar)=.FALSE.
+  !---New rank-1 term
+  nterms=nterms+1
+  vs(nterms,:)=RIstar/RIstar(Jstar)
+  us(:,nterms)=RJstar
+  step_size=SQRT(SUM(us(:,nterms)**2)*SUM(vs(nterms,:)**2))
+  IF(oft_debug_print(2))WRITE(*,'(A,3I4,2ES14.6)')oft_indent,k,Istar,Jstar,step_size,tol
+  IF(rel)THEN
+    !---Frobenius norm of the approximation, updated with the new term
+    fro2=fro2+step_size**2
+    IF(nterms>1)fro2=fro2+2.d0*SUM(MATMUL(TRANSPOSE(us(:,1:nterms-1)),us(:,nterms)) &
+      *MATMUL(vs(1:nterms-1,:),vs(nterms,:)))
+    IF((k>=min_its).AND.(step_size<tol*SQRT(ABS(fro2))))EXIT
+  ELSE
+    IF((k>=min_its).AND.(step_size<tol))EXIT
+  END IF
+  IF(k==kmax-1)THEN
+    step_size=-1.d0
+    EXIT
+  END IF
+  !---Replace the reference row if it was used as a pivot, otherwise update it with the new term
+  IF(Iref==Istar)THEN
+    DO Iref=1,nrows
+      IF(prevIstar(Iref))EXIT
+    END DO
+    CALL src%row(Iref,RIref)
+    DO i=1,nterms
+      RIref=RIref-us(Iref,i)*vs(i,:)
+    END DO
+  ELSE
+    RIref=RIref-us(Iref,nterms)*vs(nterms,:)
+  END IF
+  !---Same for the reference column
+  IF(Jref==Jstar)THEN
+    DO Jref=1,ncols
+      IF(prevJstar(Jref))EXIT
+    END DO
+    CALL src%col(Jref,RJref)
+    DO i=1,nterms
+      RJref=RJref-us(:,i)*vs(i,Jref)
+    END DO
+  ELSE
+    RJref=RJref-us(:,nterms)*vs(nterms,Jref)
+  END IF
+END DO
+IF(step_size>0.d0)THEN
+  ALLOCATE(U(nrows,nterms),V(nterms,ncols))
+  U=us(:,1:nterms)
+  V=vs(1:nterms,:)
+ELSE
+  nterms=-1
+END IF
+DEALLOCATE(us,vs,RIstar,RJstar,RIref,RJref,prevIstar,prevJstar)
+END SUBROUTINE tw_aca_plus
+!------------------------------------------------------------------------------
+!> Location of the largest value where `mask` is set
+!------------------------------------------------------------------------------
+FUNCTION tw_max_masked(vals,mask) RESULT(iloc)
+REAL(8), INTENT(in) :: vals(:) !< Values
+LOGICAL, INTENT(in) :: mask(:) !< Candidates
+INTEGER(4) :: iloc !< Index of the largest candidate value (0 if no entry of `mask` is set)
+REAL(8) :: max_tmp
+INTEGER(4) :: i
+max_tmp=-1.d99
+iloc=0
+DO i=1,SIZE(vals)
+  IF((vals(i)>max_tmp).AND.mask(i))THEN
+    max_tmp=vals(i)
+    iloc=i
+  END IF
+END DO
+END FUNCTION tw_max_masked
+!------------------------------------------------------------------------------
+!> Row: cell `i` against all segments
+!------------------------------------------------------------------------------
+SUBROUTINE tw_aca_segblock_row(self,i,vec)
+CLASS(tw_aca_segblock), INTENT(inout) :: self
+INTEGER(i4), INTENT(in) :: i
+REAL(r8), INTENT(out) :: vec(:)
+INTEGER(i4) :: j
+REAL(r8) :: pc(3,3),dm
+pc=self%mesh%r(:,self%mesh%lc(:,self%cells(i)))
+DO j=1,SIZE(vec)
+  vec(j)=tw_cell_seg_kernel(pc,self%mesh%ca(self%cells(i)),self%pts(:,j),self%pts(:,j+1),dm)
+END DO
+END SUBROUTINE tw_aca_segblock_row
+!------------------------------------------------------------------------------
+!> Column: all cells against segment `i`
+!------------------------------------------------------------------------------
+SUBROUTINE tw_aca_segblock_col(self,i,vec)
+CLASS(tw_aca_segblock), INTENT(inout) :: self
+INTEGER(i4), INTENT(in) :: i
+REAL(r8), INTENT(out) :: vec(:)
+INTEGER(i4) :: j
+REAL(r8) :: pc(3,3),dm
+DO j=1,SIZE(vec)
+  pc=self%mesh%r(:,self%mesh%lc(:,self%cells(j)))
+  vec(j)=tw_cell_seg_kernel(pc,self%mesh%ca(self%cells(j)),self%pts(:,i),self%pts(:,i+1),dm)
+END DO
+END SUBROUTINE tw_aca_segblock_col
+!------------------------------------------------------------------------------
+!> Row: basis function `MOD(i-1,3)+1` of cell `(i-1)/3+1` against all filaments
+!!
+!! All three basis functions of the cell are computed together and kept.
+!------------------------------------------------------------------------------
+SUBROUTINE tw_aca_ringblock_row(self,i,vec)
+CLASS(tw_aca_ringblock), INTENT(inout) :: self
+INTEGER(i4), INTENT(in) :: i
+REAL(r8), INTENT(out) :: vec(:)
+INTEGER(i4) :: c,j,nr
+LOGICAL :: crossed
+REAL(r8) :: pc(3,3)
+REAL(r8), ALLOCATABLE :: tmp(:,:,:)
+nr=SIZE(self%radius)
+c=(i-1)/3+1
+IF(.NOT.ALLOCATED(self%slot))THEN
+  ALLOCATE(self%slot(SIZE(self%cells)),self%rows(nr,3,16))
+  self%slot=0
+END IF
+IF(self%slot(c)==0)THEN
+  IF(self%nslot==SIZE(self%rows,3))THEN
+    ALLOCATE(tmp(nr,3,2*self%nslot))
+    tmp(:,:,1:self%nslot)=self%rows
+    CALL MOVE_ALLOC(tmp,self%rows)
+  END IF
+  self%nslot=self%nslot+1
+  self%slot(c)=self%nslot
+  pc=self%mesh%r(:,self%mesh%lc(:,self%cells(c)))
+  DO j=1,nr
+    self%rows(j,:,self%nslot)=tw_cell_ring_kernel(pc,self%mesh%ca(self%cells(c)),self%qbasis(:,:,c), &
+      self%rz(:,j),self%radius(j),crossed)
+  END DO
+END IF
+vec=self%rows(:,i-3*(c-1),self%slot(c))
+END SUBROUTINE tw_aca_ringblock_row
+!------------------------------------------------------------------------------
+!> Column: the three basis functions of all cells against filament `i`
+!------------------------------------------------------------------------------
+SUBROUTINE tw_aca_ringblock_col(self,i,vec)
+CLASS(tw_aca_ringblock), INTENT(inout) :: self
+INTEGER(i4), INTENT(in) :: i
+REAL(r8), INTENT(out) :: vec(:)
+INTEGER(i4) :: c
+LOGICAL :: crossed
+REAL(r8) :: pc(3,3)
+DO c=1,SIZE(self%cells)
+  pc=self%mesh%r(:,self%mesh%lc(:,self%cells(c)))
+  vec(3*c-2:3*c)=tw_cell_ring_kernel(pc,self%mesh%ca(self%cells(c)),self%qbasis(:,:,c),self%rz(:,i), &
+    self%radius(i),crossed)
+END DO
+END SUBROUTINE tw_aca_ringblock_col
 !---------------------------------------------------------------------------------
 !> Compute \f$ \nabla \int 1/|r-r'| dA' \f$ for a triangle (gradient with respect to the observation point)
 !!
@@ -3279,7 +3587,7 @@ END FUNCTION tw_compute_phipot
 FUNCTION tw_compute_phigrad(pt_cell,pt) RESULT(grad)
 REAL(8), INTENT(in) :: pt_cell(3,3) !< Vertices defining triangle
 REAL(8), INTENT(in) :: pt(3) !< Observation point (r)
-REAL(8) :: grad(3)
+REAL(8) :: grad(3) !< Gradient of the potential with respect to `pt`
 REAL(8) :: nhat(3),a(3),b(3),r(3,3),rmag(3),e(3),elen,num,den
 INTEGER(4) :: i,ip
 DEBUG_STACK_PUSH
@@ -3304,10 +3612,9 @@ DO i=1,3
   ip=MOD(i,3)+1
   e=r(:,ip)-r(:,i)
   elen=SQRT(SUM(e**2))
-  num=rmag(ip)*elen + SUM(r(:,ip)*e)
-  den=rmag(i)*elen + SUM(r(:,i)*e)
-  IF(ABS(den)<1.d-14.OR.elen<1.d-14)CYCLE
-  grad=grad-[e(2)*nhat(3)-e(3)*nhat(2), e(3)*nhat(1)-e(1)*nhat(3), e(1)*nhat(2)-e(2)*nhat(1)]*LOG(num/den)/elen
+  IF(elen<1.d-14)CYCLE
+  grad=grad-[e(2)*nhat(3)-e(3)*nhat(2), e(3)*nhat(1)-e(1)*nhat(3), e(1)*nhat(2)-e(2)*nhat(1)] &
+    *tw_edge_lineint(r(:,i),r(:,ip),rmag(i),rmag(ip),e,elen)/elen
 END DO
 DEBUG_STACK_POP
 END FUNCTION tw_compute_phigrad
@@ -4237,8 +4544,7 @@ CHARACTER(LEN=*), INTENT(in) :: filename !< Thin-wall model object
 CLASS(tw_type), INTENT(inout) :: self !< Thin-wall model object
 TYPE(tw_sensors), INTENT(inout) :: sensors !< Sensor container
 INTEGER(4) :: i,j,k,io_unit,ierr,id,vert,cell,p1,p2
-INTEGER(4), ALLOCATABLE :: ed_mark(:),list_out(:),hole_tmp(:,:)
-REAL(8) :: location(2),norm(3),ed_norm(3),cell_norm(3),f(3)
+REAL(8) :: norm(3),ed_norm(3),cell_norm(3),f(3)
 REAL(8), ALLOCATABLE :: hole_facs(:)
 LOGICAL :: exists
 WRITE(*,*)
