@@ -241,6 +241,11 @@ TYPE :: gs_factory
   TYPE(axi_coil_set), POINTER, DIMENSION(:) :: coils_ext => NULL() !< External coil definitions
   TYPE(coil_region), POINTER, DIMENSION(:) :: coil_regions => NULL() !< Meshed coil regions
   TYPE(oft_1d_real), POINTER, DIMENSION(:) :: dist_coil => NULL() !< Current distribution for each coil (if defined)
+  !---Quadrature cache (geometry only, built on first use by @ref gs_qcache_build)
+  REAL(r8), POINTER, CONTIGUOUS, DIMENSION(:,:,:) :: qc_rop => NULL() !< Basis values at the quadrature points [nce,np,nc]
+  REAL(r8), POINTER, CONTIGUOUS, DIMENSION(:,:,:) :: qc_pt => NULL() !< Physical position of the quadrature points [3,np,nc]
+  REAL(r8), POINTER, CONTIGUOUS, DIMENSION(:,:) :: qc_v => NULL() !< Jacobian determinant at the quadrature points [np,nc]
+  INTEGER(i4), POINTER, CONTIGUOUS, DIMENSION(:,:) :: qc_lag => NULL() !< Cell degrees of freedom [nce,nc]
   TYPE(cond_region), POINTER, DIMENSION(:) :: cond_regions => NULL() !< Meshed conducting regions
   TYPE(gs_region_info) :: region_info !< Region information for non-continuous conductors
   TYPE(oft_seam), POINTER :: coil_stitch => NULL() !< Coil vector stitching information
@@ -1583,6 +1588,34 @@ end subroutine gs_coil_source_distributed
 !------------------------------------------------------------------------------
 !> Calculate RHS source for quasi-static solve from previous \f$ \psi \f$
 !------------------------------------------------------------------------------
+!------------------------------------------------------------------------------
+!> Build the quadrature cache: basis values, Jacobian determinant and physical position at each
+!! quadrature point of every cell, and the cell degrees of freedom, so the source integrals do not
+!! re-evaluate the geometry on every iteration. The geometry is fixed once the factory is set up.
+!------------------------------------------------------------------------------
+subroutine gs_qcache_build(self)
+class(gs_factory), intent(inout) :: self !< G-S object
+integer(i4) :: j,m
+real(r8) :: goptmp(3,3),v
+logical :: curved
+IF(ASSOCIATED(self%qc_rop))RETURN
+ALLOCATE(self%qc_rop(self%fe_rep%nce,self%fe_rep%quad%np,self%fe_rep%mesh%nc))
+ALLOCATE(self%qc_pt(3,self%fe_rep%quad%np,self%fe_rep%mesh%nc))
+ALLOCATE(self%qc_v(self%fe_rep%quad%np,self%fe_rep%mesh%nc))
+ALLOCATE(self%qc_lag(self%fe_rep%nce,self%fe_rep%mesh%nc))
+!$omp parallel do private(m,goptmp,v,curved) schedule(static)
+DO j=1,self%fe_rep%mesh%nc
+  CALL self%fe_rep%ncdofs(j,self%qc_lag(:,j))
+  curved=cell_is_curved(self%fe_rep%mesh,j)
+  DO m=1,self%fe_rep%quad%np
+    IF(curved.OR.(m==1))CALL self%fe_rep%mesh%jacobian(j,self%fe_rep%quad%pts(:,m),goptmp,v)
+    self%qc_v(m,j)=v
+    self%qc_pt(:,m,j)=self%fe_rep%mesh%log2phys(j,self%fe_rep%quad%pts(:,m))
+    CALL oft_blag_eval_all(self%fe_rep,j,self%fe_rep%quad%pts(:,m),self%qc_rop(:,m,j))
+  END DO
+END DO
+end subroutine gs_qcache_build
+!------------------------------------------------------------------------------
 subroutine gs_wall_source(self,dpsi_dt,b)
 class(gs_factory), intent(inout) :: self !< G-S object
 CLASS(oft_vector), intent(inout) :: dpsi_dt !< \f$ \psi \f$ at start of step
@@ -1631,6 +1664,7 @@ IF(ASSOCIATED(self%region_info%nonaxi_vals))THEN
     reg_source(l)=DOT_PRODUCT(psi_vals,self%region_info%nonaxi_vals(:,l))
   END DO
 END IF
+IF(.NOT.ASSOCIATED(self%qc_rop))CALL gs_qcache_build(self)
 !---
 !$omp parallel private(rhs_loc,j_lag,curved,goptmp,v,m,det,pt,psitmp,l,rop,nturns,cond_norm,jc)
 allocate(rhs_loc(self%fe_rep%nce+self%ncoils))
@@ -1640,16 +1674,14 @@ allocate(j_lag(self%fe_rep%nce))
 DO j=1,self%fe_rep%mesh%nc
   nturns = MAXVAL(ABS(self%coil_nturns(self%fe_rep%mesh%reg(j),:)))
   IF(eta_reg(self%fe_rep%mesh%reg(j))<0.d0.AND.nturns<1.d-8)CYCLE
-  call self%fe_rep%ncdofs(j,j_lag)
+  j_lag=self%qc_lag(:,j)
   rhs_loc=0.d0
-  curved=cell_is_curved(self%fe_rep%mesh,j)
   do m=1,self%fe_rep%quad%np
-    if(curved.OR.(m==1))call self%fe_rep%mesh%jacobian(j,self%fe_rep%quad%pts(:,m),goptmp,v)
-    det=v*self%fe_rep%quad%wts(m)
-    pt=self%fe_rep%mesh%log2phys(j,self%fe_rep%quad%pts(:,m))
+    det=self%qc_v(m,j)*self%fe_rep%quad%wts(m)
+    pt=self%qc_pt(:,m,j)
+    rop=self%qc_rop(:,m,j)
     psitmp=0.d0
     DO l=1,self%fe_rep%nce
-      CALL oft_blag_eval(self%fe_rep,j,l,self%fe_rep%quad%pts(:,m),rop(l))
       psitmp=psitmp+psi_vals(j_lag(l))*rop(l)
     END DO
     DO l=1,self%ncoils
@@ -3489,7 +3521,7 @@ real(8) :: psitmp,gpsitmp(3),goptmp(3,3),det,pt(3),v,ffp(3),t1,gop(3),bcross_kap
 real(8), allocatable :: rhs_loc(:,:),cond_fac(:),rop(:),vcache(:)
 integer(4) :: j,m,l
 integer(4), allocatable :: j_lag(:)
-logical :: curved
+logical :: curved,use_cache
 type(oft_lag_brinterp) :: bcross_kappa_fun
 type(gs_factory), pointer :: device
 t1=omp_get_wtime()
@@ -3516,6 +3548,8 @@ itor_ffp=0.d0
 itor_press=0.d0
 estore=0.d0
 dflux_ffp=0.d0
+use_cache=.NOT.ASSOCIATED(self%P_ani) ! P_ani needs the full Jacobian (goptmp) at each point
+IF(use_cache.AND.(.NOT.ASSOCIATED(device%qc_rop)))CALL gs_qcache_build(device)
 !$omp parallel private(rhs_loc,j_lag,ffp,curved,goptmp,v,m,det,pt,psitmp,l,rop,gop,vcache,bcross_kappa,pani,gpsitmp) &
 !$omp reduction(+:itor_ffp) reduction(+:itor_press) reduction(+:estore) reduction(+:dflux_ffp)
 allocate(rhs_loc(device%fe_rep%nce,3))
@@ -3525,18 +3559,28 @@ allocate(j_lag(device%fe_rep%nce))
 do j=1,device%fe_rep%mesh%nc
   ! IF(self%cflag(j)==3)CYCLE ! Vacuum region (no source)
   IF(device%fe_rep%mesh%reg(j)/=1)CYCLE ! Only compute in plasma region
-  call device%fe_rep%ncdofs(j,j_lag)
+  IF(use_cache)THEN
+    j_lag=device%qc_lag(:,j)
+  ELSE
+    call device%fe_rep%ncdofs(j,j_lag)
+  END IF
   rhs_loc=0.d0
   DO l=1,device%fe_rep%nce
     vcache(l) = atmp(j_lag(l))
   END DO
-  curved=cell_is_curved(device%fe_rep%mesh,j)
+  IF(.NOT.use_cache)curved=cell_is_curved(device%fe_rep%mesh,j)
   do m=1,device%fe_rep%quad%np
-    if(curved.OR.(m==1))call device%fe_rep%mesh%jacobian(j,device%fe_rep%quad%pts(:,m),goptmp,v)
+    IF(use_cache)THEN
+      v=device%qc_v(m,j)
+      rop=device%qc_rop(:,m,j)
+      pt=device%qc_pt(:,m,j)
+    ELSE
+      if(curved.OR.(m==1))call device%fe_rep%mesh%jacobian(j,device%fe_rep%quad%pts(:,m),goptmp,v)
+      CALL oft_blag_eval_all(device%fe_rep,j,device%fe_rep%quad%pts(:,m),rop)
+      pt=device%fe_rep%mesh%log2phys(j,device%fe_rep%quad%pts(:,m))
+    END IF
     det=v*device%fe_rep%quad%wts(m)
-    CALL oft_blag_eval_all(device%fe_rep,j,device%fe_rep%quad%pts(:,m),rop)
     ffp=0.d0
-    pt=device%fe_rep%mesh%log2phys(j,device%fe_rep%quad%pts(:,m))
     IF(gs_test_bounds(self,pt))THEN
       psitmp=0.d0
       !$omp simd reduction(+:psitmp)
@@ -6021,6 +6065,7 @@ subroutine factory_destroy(self)
 class(gs_factory), intent(inout) :: self !< G-S object
 integer(i4) :: i,j
 IF(oft_debug_print(2))WRITE(*,*)"Destroying Grad-Shafranov factory object"
+IF(ASSOCIATED(self%qc_rop))DEALLOCATE(self%qc_rop,self%qc_pt,self%qc_v,self%qc_lag)
 IF(ASSOCIATED(self%gs_zerob_bc))THEN
   CALL self%gs_zerob_bc%delete()
   DEALLOCATE(self%gs_zerob_bc)
