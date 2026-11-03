@@ -48,6 +48,7 @@ IMPLICIT NONE
 #include "local.h"
 INTEGER(4), PARAMETER :: max_xpoints = 20
 REAL(r8), PARAMETER :: qprof_trace_tol = -1.d0 !< Tracer tolerance override for @ref gs_get_qprof, <0 for default (testing only)
+REAL(r8), PARAMETER :: dt_rtol = 1.d-12 !< Relative change in the time step below which the time-dependent matrix is reused
 INTEGER(i4), PARAMETER :: qprof_backend = 0 !< Flux-surface backend (q profile, averages, toroidal flux map, Sauter factors): 0 contour where supported, 1 field-line tracer (testing only; the sawtooth reset needs the contour and is skipped)
 !------------------------------------------------------------------------------
 !> Interpolation class for uniform source with simple tokamak representation
@@ -2333,7 +2334,7 @@ IF(self%dt>0.d0)THEN
     CALL self%aug_vec%new(psi_aug)
     CALL self%aug_vec%new(tmp_aug)
   END IF
-  IF(self%dt/=self%dt_last)THEN
+  IF(ABS(self%dt-self%dt_last)>dt_rtol*ABS(self%dt))THEN ! rebuild only for a real change in dt, not round-off
     CALL build_dels(self%dels_dt,self,"free",self%dt)
     self%dt_last=self%dt
     self%lu_solver_dt%refactor=.TRUE.
@@ -3219,7 +3220,7 @@ END IF
 !
 ! self%o_point(1)=-1.d0
 IF(self%dt>0.d0)THEN
-  IF(self%dt/=self%dt_last)THEN
+  IF(ABS(self%dt-self%dt_last)>dt_rtol*ABS(self%dt))THEN ! rebuild only for a real change in dt, not round-off
     CALL build_dels(self%dels_dt,self,"free",self%dt)
     self%dt_last=self%dt
     self%lu_solver_dt%refactor=.TRUE.
