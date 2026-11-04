@@ -34,7 +34,7 @@ USE oft_lag_basis, ONLY: oft_blag_geval, oft_blag_eval, oft_blag_npos, &
   oft_scalar_bfem
 USE oft_blag_operators, ONLY: oft_lag_brinterp
 USE axi_green, ONLY: green
-USE oft_gs, ONLY: gs_epsilon, flux_func, gs_factory, gs_equil, gs_update_bounds, &
+USE oft_gs, ONLY: gs_epsilon, flux_func, gs_factory, gs_equil, gs_update_bounds, gs_qcache_build, &
     gs_test_bounds, gs_mat_create, compute_bcmat, set_bcmat, build_dels
 USE mhd_utils, ONLY: mu0
 IMPLICIT NONE
@@ -720,6 +720,8 @@ alam_vals=0.d0
 ! Operator integration
 !------------------------------------------------------------------------------
 diag=0.d0
+!---Geometry and basis values at the quadrature points come from the device cache
+IF(.NOT.ASSOCIATED(self%gs_device%qc_rop))CALL gs_qcache_build(self%gs_device)
 !$omp parallel private(j,vals_loc,rop,gop,det,curved,goptmp,m,vol,jr,jc,pt, &
 !$omp psi_tmp,dpsi_tmp,p_source,f_source,eta_source,in_bounds) &
 !$omp reduction(+:diag)
@@ -730,17 +732,16 @@ allocate(rop(lag_rep%nce),gop(3,lag_rep%nce)) ! Reconstructed gradient operator
 do i=1,mesh%nc
     IF(mesh%reg(i)/=1)CYCLE
     !---Get local to global DOF mapping
-    call lag_rep%ncdofs(i,j)
+    j=self%gs_device%qc_lag(:,i)
     !---Get local reconstructed operators
     vals_loc=0.d0
     do m=1,lag_rep%quad%np ! Loop over quadrature points
-        call mesh%jacobian(i,lag_rep%quad%pts(:,m),goptmp,vol)
-        det=vol*lag_rep%quad%wts(m)
-        pt=mesh%log2phys(i,lag_rep%quad%pts(:,m))
+        det=self%gs_device%qc_v(m,i)*lag_rep%quad%wts(m)
+        pt=self%gs_device%qc_pt(:,m,i)
         IF(.NOT.gs_test_bounds(self%gs_equil,pt))CYCLE
+        rop=self%gs_device%qc_rop(:,m,i)
         psi_tmp=0.d0!; dpsi_tmp=0.d0
         do jr=1,lag_rep%nce ! Loop over degrees of freedom
-            call oft_blag_eval(lag_rep,i,jr,lag_rep%quad%pts(:,m),rop(jr))
             psi_tmp = psi_tmp + pol_vals(j(jr))*rop(jr)
         end do
         IF(psi_tmp<self%gs_equil%plasma_bounds(1))CYCLE
