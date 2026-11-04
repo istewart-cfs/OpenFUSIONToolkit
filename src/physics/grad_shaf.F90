@@ -1858,88 +1858,112 @@ end subroutine gs_coil_mutual_distributed
 !------------------------------------------------------------------------------
 subroutine gs_plasma_mutual(self,b,mutual,itor)
 class(gs_equil), intent(inout) :: self !< G-S solver object
-CLASS(oft_vector), intent(inout) :: b !< \f$ \psi \f$ for mutual calculation
+CLASS(oft_vector), TARGET, intent(inout) :: b !< \f$ \psi \f$ for mutual calculation
 real(8), intent(out) :: mutual !< Mutual inductance \f$ \int J_p \psi dV / I_p \f$
 real(8), intent(out) :: itor !< Plasma toroidal current
-real(r8), pointer, dimension(:) :: btmp
-real(8) :: psitmp(1),goptmp(3,3),det,pt(3),v,t1,b_tmp,itor_loc,pani(2),bcross_kappa(1),gpsitmp(3)
-real(8), allocatable :: rhs_loc(:),cond_fac(:),rop(:)
-integer(4) :: j,m,l,k
+TYPE(oft_vector_ptr) :: bvecs(1)
+real(8) :: mutuals(1)
+bvecs(1)%f=>b
+CALL gs_plasma_mutuals(self,1,bvecs,mutuals,itor)
+mutual=mutuals(1)
+end subroutine gs_plasma_mutual
+!------------------------------------------------------------------------------
+!> Compute inductances between plasma current and several poloidal fluxes
+!!
+!! Equivalent to calling @ref gs_plasma_mutual for each flux, but the plasma current
+!! density is evaluated only once at each quadrature point
+!------------------------------------------------------------------------------
+subroutine gs_plasma_mutuals(self,nb,bvecs,mutual,itor)
+class(gs_equil), intent(inout) :: self !< G-S solver object
+integer(4), intent(in) :: nb !< Number of fluxes
+TYPE(oft_vector_ptr), intent(inout) :: bvecs(nb) !< \f$ \psi \f$ for each mutual calculation
+real(8), intent(out) :: mutual(nb) !< Mutual inductances \f$ \int J_p \psi dV / I_p \f$
+real(8), intent(out) :: itor !< Plasma toroidal current
+real(r8), pointer, dimension(:) :: btmp,psi_vals
+real(8) :: psitmp,goptmp(3,3),det,pt(3),v,itor_loc,pani(2),bcross_kappa(1)
+real(8), allocatable :: bvals(:,:),rop(:),vcache(:),bcache(:,:),mutual_loc(:)
+integer(4) :: i,j,m,l
 integer(4), allocatable :: j_lag(:)
-logical :: curved
-type(oft_lag_brinterp), target :: psi_eval,bcross_kappa_fun
-type(oft_lag_bginterp), target :: psi_geval
+type(oft_lag_brinterp), target :: bcross_kappa_fun
 type(gs_factory), pointer :: device
-! t1=omp_get_wtime()
 !---
 device=>self%device
-NULLIFY(btmp)
-CALL b%get_local(btmp)
-psi_eval%u=>self%psi
-CALL psi_eval%setup(device%fe_rep)
+NULLIFY(btmp,psi_vals)
+CALL bvecs(1)%f%get_local(btmp)
+ALLOCATE(bvals(nb,SIZE(btmp)))
+bvals(1,:)=btmp
+DO i=2,nb
+  CALL bvecs(i)%f%get_local(btmp)
+  bvals(i,:)=btmp
+END DO
+DEALLOCATE(btmp)
+CALL self%psi%get_local(psi_vals)
 IF(ASSOCIATED(self%P_ani))THEN
-  CALL psi_geval%shared_setup(psi_eval)
   CALL self%psi%new(bcross_kappa_fun%u)
   CALL gs_bcrosskappa(self,bcross_kappa_fun%u)
   CALL bcross_kappa_fun%setup(device%fe_rep)
 ELSE
   NULLIFY(bcross_kappa_fun%u)
 END IF
+IF(.NOT.ASSOCIATED(device%qc_rop))CALL gs_qcache_build(device)
 !---
 mutual=0.d0
 itor=0.d0
-!$omp parallel private(j,j_lag,curved,goptmp,v,m,det,pt,psitmp,b_tmp,l,rop,itor_loc,pani,bcross_kappa,gpsitmp) reduction(+:mutual) &
+!$omp parallel private(j,j_lag,goptmp,v,m,det,pt,psitmp,l,rop,vcache,bcache,itor_loc,pani,bcross_kappa,mutual_loc) &
 !$omp reduction(+:itor)
-allocate(rop(device%fe_rep%nce))
+allocate(rop(device%fe_rep%nce),vcache(device%fe_rep%nce))
 allocate(j_lag(device%fe_rep%nce))
+allocate(bcache(nb,device%fe_rep%nce),mutual_loc(nb))
+mutual_loc=0.d0
 !$omp do schedule(static)
 DO j=1,device%fe_rep%mesh%nc
   IF(device%fe_rep%mesh%reg(j)/=1)CYCLE
-  call device%fe_rep%ncdofs(j,j_lag)
-  curved=cell_is_curved(device%fe_rep%mesh,j)
+  j_lag=device%qc_lag(:,j)
+  DO l=1,device%fe_rep%nce
+    vcache(l)=psi_vals(j_lag(l))
+    bcache(:,l)=bvals(:,j_lag(l))
+  END DO
   do m=1,device%fe_rep%quad%np
-    if(curved.OR.(m==1))call device%fe_rep%mesh%jacobian(j,device%fe_rep%quad%pts(:,m),goptmp,v)
-    call psi_eval%interp(j,device%fe_rep%quad%pts(:,m),goptmp,psitmp)
-    pt=device%fe_rep%mesh%log2phys(j,device%fe_rep%quad%pts(:,m))
-    !---Compute Magnetic Field
-    IF(gs_test_bounds(self,pt).AND.psitmp(1)>self%plasma_bounds(1))THEN
-      IF(self%mode==0)THEN
-        itor_loc = self%I%Fp(psitmp(1))*((self%ffp_scale**2)*self%I%f(psitmp(1))+self%ffp_scale*self%I%f_offset)/(pt(1)+gs_epsilon)
-      ELSE
-        itor_loc = 0.5d0*self%ffp_scale*self%I%Fp(psitmp(1))/(pt(1)+gs_epsilon)
-      END IF
-      ! Handle anisotropic pressure
-      IF(ASSOCIATED(self%P_ani))THEN
-        CALL self%P_ani%interp(j,device%fe_rep%quad%pts(:,m),goptmp,pani)
-        CALL bcross_kappa_fun%interp(j,device%fe_rep%quad%pts(:,m),goptmp,bcross_kappa)
-        itor_loc = itor_loc + self%p_scale*pt(1)*(self%P%fp(psitmp(1))*pani(2)+self%P%f(psitmp(1))*(pani(1)-pani(2))*bcross_kappa(1))
-      ELSE
-        itor_loc = itor_loc + self%p_scale*pt(1)*self%P%Fp(psitmp(1))
-      END IF
-      b_tmp=0.d0
-      DO l=1,device%fe_rep%nce
-        CALL oft_blag_eval(device%fe_rep,j,l,device%fe_rep%quad%pts(:,m),rop(l))
-        b_tmp=b_tmp+btmp(j_lag(l))*rop(l)
-      END DO
-      det = v*device%fe_rep%quad%wts(m)
-      itor = itor + itor_loc*det
-      mutual = mutual + b_tmp*itor_loc*det
+    pt=device%qc_pt(:,m,j)
+    IF(.NOT.gs_test_bounds(self,pt))CYCLE
+    rop=device%qc_rop(:,m,j)
+    psitmp=0.d0
+    DO l=1,device%fe_rep%nce
+      psitmp=psitmp+vcache(l)*rop(l)
+    END DO
+    IF(psitmp<=self%plasma_bounds(1))CYCLE
+    IF(self%mode==0)THEN
+      itor_loc = self%I%Fp(psitmp)*((self%ffp_scale**2)*self%I%f(psitmp)+self%ffp_scale*self%I%f_offset)/(pt(1)+gs_epsilon)
+    ELSE
+      itor_loc = 0.5d0*self%ffp_scale*self%I%Fp(psitmp)/(pt(1)+gs_epsilon)
     END IF
+    ! Handle anisotropic pressure
+    IF(ASSOCIATED(self%P_ani))THEN
+      call device%fe_rep%mesh%jacobian(j,device%fe_rep%quad%pts(:,m),goptmp,v)
+      CALL self%P_ani%interp(j,device%fe_rep%quad%pts(:,m),goptmp,pani)
+      CALL bcross_kappa_fun%interp(j,device%fe_rep%quad%pts(:,m),goptmp,bcross_kappa)
+      itor_loc = itor_loc + self%p_scale*pt(1)*(self%P%fp(psitmp)*pani(2)+self%P%f(psitmp)*(pani(1)-pani(2))*bcross_kappa(1))
+    ELSE
+      itor_loc = itor_loc + self%p_scale*pt(1)*self%P%Fp(psitmp)
+    END IF
+    det = device%qc_v(m,j)*device%fe_rep%quad%wts(m)
+    itor = itor + itor_loc*det
+    mutual_loc = mutual_loc + MATMUL(bcache,rop)*itor_loc*det
   end do
 end do
-deallocate(j_lag,rop)
+!$omp critical
+mutual = mutual + mutual_loc
+!$omp end critical
+deallocate(j_lag,rop,vcache,bcache,mutual_loc)
 !$omp end parallel
 mutual=mu0*2.d0*pi*mutual/itor
 IF(ASSOCIATED(bcross_kappa_fun%u))THEN
   CALL bcross_kappa_fun%u%delete
   DEALLOCATE(bcross_kappa_fun%u)
   CALL bcross_kappa_fun%delete
-  CALL psi_geval%delete()
 END IF
-CALL psi_eval%delete()
-DEALLOCATE(btmp)
-! self%timing(2)=self%timing(2)+(omp_get_wtime()-t1)
-end subroutine gs_plasma_mutual
+DEALLOCATE(bvals,psi_vals)
+end subroutine gs_plasma_mutuals
 !------------------------------------------------------------------------------
 !> Compute coil currents to best fit isoflux, flux, and saddle targets at current solution
 !------------------------------------------------------------------------------

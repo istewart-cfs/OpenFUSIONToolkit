@@ -32,7 +32,7 @@ USE mhd_utils, ONLY: mu0
 USE axi_green, ONLY: green
 USE oft_gs, ONLY: gs_factory, gs_equil, gs_save_fields, gs_setup_walls, build_dels, flux_func, &
   gs_fixed_vflux, gs_get_qprof, gs_trace_surf, gs_b_interp, gs_j_interp, gs_prof_interp, &
-  gs_plasma_mutual, gs_source, gs_err_reason, gs_coil_source, gs_coil_source_distributed, gs_vacuum_solve, &
+  gs_plasma_mutual, gs_plasma_mutuals, gs_source, gs_err_reason, gs_coil_source, gs_coil_source_distributed, gs_vacuum_solve, &
   gs_coil_mutual_pair, gs_project_b, gs_save_mug, gs_update_bounds
 USE oft_gs_util, ONLY: gs_comp_globals, gs_save_eqdsk, gs_save_ifile, gs_profile_load, gs_profile_save, &
   gs_calc_vloop, gs_save_tokamaker, gs_load_tokamaker
@@ -1534,23 +1534,28 @@ REAL(8), POINTER, DIMENSION(:) :: vals_tmp
 INTEGER(4) :: i
 REAL(8) :: tmp1,tmp2,tmp3,tmp4,itor
 CLASS(oft_vector), POINTER :: rhs,vec1,vec2
+TYPE(oft_vector_ptr), ALLOCATABLE :: bvecs(:)
 TYPE(gs_equil), POINTER :: tMaker_equil_obj
 IF(.NOT.tokamaker_equil_ccast(tMaker_equil_ptr,tMaker_equil_obj,error_str))RETURN
 !---Compute plasma row/column
 CALL c_f_pointer(Lmat, vals_tmp, [tMaker_equil_obj%device%ncoils+1])
 IF(tMaker_equil_obj%has_plasma)THEN
-  DO i=1,tMaker_equil_obj%device%ncoils
-    CALL gs_plasma_mutual(tMaker_equil_obj,tMaker_equil_obj%device%psi_coil(i)%f,vals_tmp(i),itor)
-  END DO
-  !
+  !---Flux from the plasma current
   CALL tMaker_equil_obj%psi%new(rhs)
   CALL tMaker_equil_obj%psi%new(vec1)
   CALL tMaker_equil_obj%psi%new(vec2)
   CALL gs_source(tMaker_equil_obj,tMaker_equil_obj%psi,rhs,vec1,vec2,tmp1,tmp2,tmp3,tmp4)
   CALL vec1%set(0.d0)
   CALL tMaker_equil_obj%device%lu_solver%apply(vec1,rhs)
-  CALL gs_plasma_mutual(tMaker_equil_obj,vec1,vals_tmp(tMaker_equil_obj%device%ncoils+1),itor)
+  !---Mutuals with each coil and with the plasma flux in one pass
+  ALLOCATE(bvecs(tMaker_equil_obj%device%ncoils+1))
+  DO i=1,tMaker_equil_obj%device%ncoils
+    bvecs(i)%f=>tMaker_equil_obj%device%psi_coil(i)%f
+  END DO
+  bvecs(tMaker_equil_obj%device%ncoils+1)%f=>vec1
+  CALL gs_plasma_mutuals(tMaker_equil_obj,tMaker_equil_obj%device%ncoils+1,bvecs,vals_tmp,itor)
   vals_tmp(tMaker_equil_obj%device%ncoils+1)=vals_tmp(tMaker_equil_obj%device%ncoils+1)/itor
+  DEALLOCATE(bvecs)
   CALL rhs%delete()
   CALL vec1%delete()
   CALL vec2%delete()
