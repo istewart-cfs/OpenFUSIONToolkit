@@ -33,7 +33,7 @@ USE axi_green, ONLY: green
 USE oft_gs, ONLY: gs_factory, gs_equil, gs_save_fields, gs_setup_walls, build_dels, flux_func, &
   gs_fixed_vflux, gs_get_qprof, gs_trace_surf, gs_b_interp, gs_j_interp, gs_prof_interp, &
   gs_plasma_mutual, gs_plasma_mutuals, gs_source, gs_err_reason, gs_coil_source, gs_coil_source_distributed, gs_vacuum_solve, &
-  gs_coil_mutual_pair, gs_project_b, gs_save_mug, gs_update_bounds
+  gs_coil_mutual_pair, gs_project_b, gs_save_mug, gs_update_bounds, gs_qcache_build
 USE oft_gs_util, ONLY: gs_comp_globals, gs_save_eqdsk, gs_save_ifile, gs_profile_load, gs_profile_save, &
   gs_calc_vloop, gs_save_tokamaker, gs_load_tokamaker
 USE oft_gs_profiles, ONLY: torflux_map, torflux_setup, torflux_attach, torflux_unwrap
@@ -42,7 +42,6 @@ USE oft_gs_td, ONLY: oft_tmaker_td, eig_gs_td
 USE grad_shaf_prof_phys, ONLY: create_dipole_b0_prof, dipole_ani_press, mirror_ani_slosh, gs_flux_int
 USE grad_shaf_bootstrap, ONLY: jphi_bs_flux_func, sauter_fc, saw_reset_1d, boot_prof_access, jphi_bs_carry_ffp, &
   jphi_bs_missing_inputs
-USE diagnostic, ONLY: bscal_surf_int
 USE oft_base_f, ONLY: copy_string, copy_string_rev, oftpy_init
 IMPLICIT NONE
 #include "local.h"
@@ -1458,26 +1457,31 @@ TYPE(c_ptr), VALUE, INTENT(in) :: vec_vals !< Value of integrand at node points
 INTEGER(c_int), VALUE, INTENT(in) :: reg_ind !< Index of region to integrate over (`reg_ind < 0` -> full domain)
 REAL(c_double), INTENT(out) :: result !< \f$ \int f dA \f$
 CHARACTER(KIND=c_char), INTENT(out) :: error_str(OFT_ERROR_SLEN) !< Error string (empty if no error)
-INTEGER(4) :: i,m
-real(8) :: goptmp(3,3),v,pt(3),valtmp(1)
+INTEGER(4) :: i,m,l
+real(8) :: valtmp
 REAL(8), POINTER, DIMENSION(:) :: vals_tmp
-CLASS(oft_vector), POINTER :: u
-TYPE(oft_lag_brinterp) :: field
+TYPE(gs_factory), POINTER :: device
 TYPE(tokamaker_instance), POINTER :: tMaker_obj
 IF(.NOT.tokamaker_ccast(tMaker_ptr,tMaker_obj,error_str))RETURN
-NULLIFY(field%u)
-CALL tMaker_obj%device%fe_rep%vec_create(field%u)
-CALL c_f_pointer(vec_vals, vals_tmp, [field%u%n])
-CALL field%u%restore_local(vals_tmp)
-CALL field%setup(tMaker_obj%device%fe_rep)
-IF(reg_ind>0)THEN
-  result = bscal_surf_int(tMaker_obj%device%mesh,field,tMaker_obj%device%fe_rep%quad%order,reg_ind)
-ELSE
-  result = bscal_surf_int(tMaker_obj%device%mesh,field,tMaker_obj%device%fe_rep%quad%order)
-END IF
-CALL field%u%delete
-DEALLOCATE(field%u)
-CALL field%delete
+device=>tMaker_obj%device
+CALL c_f_pointer(vec_vals, vals_tmp, [device%fe_rep%ne])
+!---Integrate with the cached quadrature geometry and basis values
+IF(.NOT.ASSOCIATED(device%qc_rop))CALL gs_qcache_build(device)
+result=0.d0
+!$omp parallel do private(m,l,valtmp) reduction(+:result) schedule(static)
+DO i=1,device%mesh%nc
+  IF(reg_ind>0)THEN
+    IF(device%mesh%reg(i)/=reg_ind)CYCLE
+  END IF
+  DO m=1,device%fe_rep%quad%np
+    valtmp=0.d0
+    DO l=1,device%fe_rep%nce
+      valtmp=valtmp+vals_tmp(device%qc_lag(l,i))*device%qc_rop(l,m,i)
+    END DO
+    result = result + valtmp*device%qc_v(m,i)*device%fe_rep%quad%wts(m)
+  END DO
+END DO
+result=oft_mpi_sum(result)
 END SUBROUTINE tokamaker_area_int
 !---------------------------------------------------------------------------------
 !> Compute the area integral of a flux function over the plasma region

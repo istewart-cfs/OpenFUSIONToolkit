@@ -1438,6 +1438,43 @@ NULLIFY(btmp)
 ! IF(.NOT.ASSOCIATED(self%cflag))CALL gs_setup_cflag(self)
 call b%set(0.d0)
 CALL b%get_local(btmp)
+!---Lagrange field source: interpolate with the cached quadrature geometry and basis values
+SELECT TYPE(source_fun)
+TYPE IS(oft_lag_brinterp)
+  IF(ASSOCIATED(source_fun%lag_rep,self%fe_rep))THEN
+    IF(.NOT.ASSOCIATED(self%qc_rop))CALL gs_qcache_build(self)
+    !$omp parallel private(j,rhs_loc,det,m,l,rop,source_tmp)
+    allocate(rhs_loc(self%fe_rep%nce))
+    allocate(rop(self%fe_rep%nce))
+    !$omp do schedule(static)
+    DO j=1,self%fe_rep%mesh%nc
+      IF(self%fe_rep%mesh%reg(j)/=1)CYCLE
+      rhs_loc=0.d0
+      do m=1,self%fe_rep%quad%np
+        det=self%qc_v(m,j)*self%fe_rep%quad%wts(m)
+        rop=self%qc_rop(:,m,j)
+        source_tmp(1)=0.d0
+        DO l=1,self%fe_rep%nce
+          source_tmp(1)=source_tmp(1)+source_fun%vals(self%qc_lag(l,j))*rop(l)
+        END DO
+        !$omp simd
+        do l=1,self%fe_rep%nce
+          rhs_loc(l)=rhs_loc(l)+rop(l)*source_tmp(1)*det
+        end do
+      end do
+      do l=1,self%fe_rep%nce
+        m = self%qc_lag(l,j)
+        !$omp atomic
+        btmp(m)=btmp(m)+rhs_loc(l)
+      end do
+    end do
+    deallocate(rhs_loc,rop)
+    !$omp end parallel
+    CALL b%restore_local(btmp,add=.TRUE.)
+    DEALLOCATE(btmp)
+    RETURN
+  END IF
+END SELECT
 !---
 !!$omp parallel private(j,rhs_loc,j_lag,ffp,curved,goptmp,v,m,det,pt,psitmp,l,rop,source_tmp)
 allocate(rhs_loc(self%fe_rep%nce))
